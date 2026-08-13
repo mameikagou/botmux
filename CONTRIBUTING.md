@@ -189,10 +189,12 @@ pnpm test:bench --compare   # serial vs parallel vs parallel+time-scale table
 
 ### Timing-Sensitive Test Contract
 
-- Treat `ready` as a happens-before barrier, not a progress log: publish it only
-  after every handler, listener, resource, and durable state needed by the
-  parent's next action is installed.
-- Establish preconditions through observable events or state. Fixed sleeps may
+- Treat a test fixture's `ready` handshake as a happens-before barrier, not a
+  progress log: publish it only after every handler, listener, resource, and
+  durable state needed by the parent's next action is installed.
+- Establish preconditions and postconditions through the exact observable event
+  or state under assertion. Do not infer sibling or downstream telemetry from a
+  lifecycle event unless its contract explicitly orders them. Fixed sleeps may
   model intentional timing or bound a hang, but must not stand in for readiness.
 - Make scheduler-sensitive ordering deterministic in the fixture. Widen a
   timeout only for proven slow-but-progressing work, and never use retries to
