@@ -163,6 +163,36 @@ describe('dashboard IPC server', () => {
     expect(res.status).toBe(404);
   });
 
+  it('projects the configured API-task Full Access capability for /api/bots aggregation', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-api-full-access-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-api-full-access-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+        apiTaskFullAccess: true,
+      }]));
+      loadBotConfigs().forEach((cfg: any) => registerBot(cfg));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-default-oncall`);
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ apiTaskFullAccess: true });
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('binds and serves health early but holds authenticated state routes behind readiness', async () => {
     setIpcAuthSecret(TEST_IPC_SECRET);
     let releaseReady!: () => void;

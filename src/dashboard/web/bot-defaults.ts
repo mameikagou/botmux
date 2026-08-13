@@ -65,6 +65,10 @@ export type BotDefaultsRow = {
   autoboundChatCount?: number;
   brandLabel?: string | null;
   sandbox?: boolean;
+  /** Owner-configured Full Access for newly-created HTTP virtual/API tasks. */
+  apiTaskFullAccess?: boolean;
+  /** Raw owner-configured read-isolation override. */
+  readIsolation?: boolean;
   /** Three-tier sandbox path whitelist (highest-precedence FsPolicy layer).
    *  null/absent = none configured (pure deny-by-default baseline). */
   sandboxPaths?: { readWrite: string[]; readOnly: string[]; deny: string[] } | null;

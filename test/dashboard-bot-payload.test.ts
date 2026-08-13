@@ -200,6 +200,21 @@ describe('dashboard bot payload helpers', () => {
     expect(botDefaultsPayload(daemon, { sandboxPaths: ['nope'] as any })).toMatchObject({ sandboxPaths: null });
   });
 
+  it('projects API-task and overriding isolation readiness fields', () => {
+    const daemon = { larkAppId: 'app_travel', botName: 'Travel', cliId: 'codex' };
+    expect(botDefaultsPayload(daemon, {
+      apiTaskFullAccess: true,
+      readIsolation: true,
+    })).toMatchObject({
+      apiTaskFullAccess: true,
+      readIsolation: true,
+    });
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({
+      apiTaskFullAccess: false,
+      readIsolation: false,
+    });
+  });
+
   it('derives agentSelectionKey from cliId + wrapperCli so the 修改CLI dropdown highlights wrapper gateways', () => {
     // 裸 CLI：选择键 = cliId。
     expect(botDefaultsPayload(
