@@ -1027,6 +1027,35 @@ describe('parseBotConfigsFromText — apiOnly', () => {
 
 // ─── core-only synthesis (BOTMUX_CORE_ONLY) ─────────────────────────────────
 
+describe('parseBotConfigsFromText — API-task Full Access', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('preserves an explicit per-bot API-task Full Access capability', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'app_travel', larkAppSecret: 's', apiTaskFullAccess: true },
+    ]));
+
+    expect(cfg.apiTaskFullAccess).toBe(true);
+  });
+
+  it.each([
+    ['missing field', {}],
+    ['explicit false', { apiTaskFullAccess: false }],
+    ['string "true"', { apiTaskFullAccess: 'true' }],
+    ['truthy number', { apiTaskFullAccess: 1 }],
+  ] as const)('grants no capability for %s — only literal true opts out of isolation', (_name, extra) => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'app_travel', larkAppSecret: 's', ...extra },
+    ]));
+
+    expect(cfg.apiTaskFullAccess).toBeUndefined();
+  });
+});
+
 describe('loadBotConfigs — core-only synthesis (BOTMUX_CORE_ONLY=1)', () => {
   let mod: Awaited<ReturnType<typeof freshImport>>;
   let fsMock: { existsSync: ReturnType<typeof vi.fn>; readFileSync: ReturnType<typeof vi.fn>; statSync: ReturnType<typeof vi.fn> };

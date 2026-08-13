@@ -1121,6 +1121,13 @@ export interface BotConfig {
   chatFeedbackPolicies?: Record<string, FeedbackPolicyInput>;
   feedbackWebhooks?: { destinations: FeedbackWebhookDestination[] };
   /**
+   * Allow freshly-created HTTP virtual/API task sessions to run without
+   * Botmux's outer file sandbox. This is a trusted per-bot capability, never a
+   * caller-controlled trigger option. Missing/false keeps API tasks isolated.
+   * Host/global mandatory sandbox settings still take precedence.
+   */
+  apiTaskFullAccess?: boolean;
+  /**
    * 租户品牌：`'feishu'`（中国版，open.feishu.cn）或 `'lark'`（国际版，
    * open.larksuite.com）。缺省 / 旧 bots.json 无此字段 → 视为 `'feishu'`
    * （见 {@link normalizeBrand}），向后兼容。决定 SDK Client / WSClient 的
@@ -2737,6 +2744,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // upload etc. already degrade gracefully on an empty secret.
       larkAppSecret: entry.larkAppSecret ?? '',
       apiOnly: entry.apiOnly === true || undefined,
+      apiTaskFullAccess: entry.apiTaskFullAccess === true || undefined,
       feedback: entry.feedback === undefined
         ? undefined
         : normalizeFeedbackPolicyLayer(entry.feedback),

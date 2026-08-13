@@ -1589,6 +1589,12 @@ async function triggerSessionTurnAdmitted(
     session.lastMessageAt = new Date(now).toISOString();
     session.workingDir = wd.workingDir;
     session.cliId = bot.config.cliId;
+    // Full Access is trusted bot configuration, not a trigger option. Freeze it
+    // only on newly-created HTTP virtual/API sessions so ordinary chats and
+    // follow-up turns can never acquire it from a request.
+    if (httpVirtual && bot.config.apiTaskFullAccess === true) {
+      session.apiTaskFullAccess = true;
+    }
     // Per-turn model / reasoning-effort override — scoped to codex-family bots
     // (the documented B-mode target) and to a freshly-created trigger session.
     // Gating on cliId keeps the contract honest and bounded: it never silently

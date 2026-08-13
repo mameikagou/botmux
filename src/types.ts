@@ -514,6 +514,12 @@ export interface Session {
   /** Exact persistent host/agent selected by the worker for restore and cleanup. */
   persistentBackendTarget?: PersistentBackendTarget;
   /**
+   * Trusted per-bot Full Access decision frozen when a fresh HTTP virtual/API
+   * task session is created. Ordinary chat sessions and legacy sessions never
+   * acquire it. Host/global mandatory sandbox settings still take precedence.
+   */
+  apiTaskFullAccess?: true;
+  /**
    * Sandbox decision RECORDED AT SESSION CREATION (fs-policy file-isolation). The
    * live bot flag (BotConfig.sandbox) can be toggled later, but a session's
    * sandbox status is frozen here at creation so a restore/restart never

@@ -305,11 +305,8 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     expect(fedRoster).toContain('larkTransportEnabled: b.larkTransportEnabled,');
   });
 
-  it('no-transport session FORCES read isolation on fresh/resume/restart; adopt is refused at restore', () => {
-    // fresh-spawn forkWorker (shared by fresh/resume/restart) forces read
-    // isolation for a no-transport session — the fail-closed credential boundary.
+  it('no-transport adopt is refused at restore', () => {
     const wp = readFileSync(resolve('src/core/worker-pool.ts'), 'utf8');
-    expect(wp).toContain('readIsolation: botCfg.readIsolation === true\n      || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly })');
     // Adopt does NOT gate via the init field (the observe branch returns before
     // fs-policy is built — an init readIsolation would be a dead no-op). Instead
     // adoptSandboxBlocked refuses a no-transport adopt at daemon restore and

@@ -110,6 +110,7 @@ beforeEach(() => {
   process.env.SESSION_DATA_DIR = tempDir;
   sessionSeq = 0; createdSessions.length = 0;
   forkShouldThrow = false;
+  mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: true } });
   mockForkWorker.mockClear(); mockCloseSession.mockClear();
 });
 afterEach(() => {
@@ -119,6 +120,46 @@ afterEach(() => {
 });
 
 describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
+  it('freezes a trusted per-bot Full Access capability onto a fresh HTTP virtual session', async () => {
+    mockGetBot.mockReturnValue({
+      config: { cliId: 'codex-app', apiOnly: true, apiTaskFullAccess: true },
+    });
+
+    const res = await triggerSessionTurn(freshAsyncReq('k-full-access'), {
+      larkAppId: APP,
+      activeSessions: new Map(),
+    });
+
+    expect(res.ok).toBe(true);
+    expect(createdSessions[0]?.apiTaskFullAccess).toBe(true);
+  });
+
+  it('ignores a forged trigger option and does not retrofit the reused session after config changes', async () => {
+    const request = freshAsyncReq('k-no-self-elevation') as TriggerRequest & {
+      options: NonNullable<TriggerRequest['options']> & {
+        apiTaskFullAccess: boolean;
+      };
+    };
+    request.options.apiTaskFullAccess = true;
+
+    const first = await triggerSessionTurn(request, {
+      larkAppId: APP,
+      activeSessions: new Map(),
+    });
+    expect(first.ok).toBe(true);
+    expect(createdSessions[0]?.apiTaskFullAccess).toBeUndefined();
+
+    mockGetBot.mockReturnValue({
+      config: { cliId: 'codex-app', apiOnly: true, apiTaskFullAccess: true },
+    });
+    const retry = await triggerSessionTurn(request, {
+      larkAppId: APP,
+      activeSessions: new Map(),
+    });
+    expect(retry.idempotent).toBe(true);
+    expect(createdSessions[0]?.apiTaskFullAccess).toBeUndefined();
+  });
+
   it('first call: forks once, writes a reserved→attempting lease, returns idempotent:false', async () => {
     const res = await triggerSessionTurn(freshAsyncReq('k-1'), { larkAppId: APP, activeSessions: new Map() });
     expect(res.ok).toBe(true);

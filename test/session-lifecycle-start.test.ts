@@ -1894,6 +1894,91 @@ describe('adopt worker re-fork forwards the incoming turn (PR#293 issue #3)', ()
   });
 });
 
+describe('HTTP virtual session isolation', () => {
+  function makeHttpDs(apiTaskFullAccess?: true) {
+    return makeDs({
+      chatId: 'http_async_travel',
+      session: {
+        ...makeDs().session,
+        chatId: 'http_async_travel',
+        rootMessageId: 'http_async_travel',
+        scope: 'chat',
+        apiTaskFullAccess,
+      },
+    });
+  }
+
+  it('does not force read isolation for a session carrying the frozen per-bot Full Access decision', () => {
+    const ds = makeHttpDs(true);
+
+    forkWorker(ds, 'observe travel', false);
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(init).toEqual(expect.objectContaining({
+      type: 'init',
+      readIsolation: false,
+    }));
+  });
+
+  it('keeps ordinary HTTP virtual sessions read-isolated by default', () => {
+    // A live config change must not retrofit a capability onto an existing
+    // session that was created without the frozen marker.
+    vi.mocked(getBot).mockImplementation(() =>
+      defaultBot({ apiTaskFullAccess: true }),
+    );
+    forkWorker(makeHttpDs(), 'ordinary API task', false);
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(init).toEqual(expect.objectContaining({ readIsolation: true }));
+  });
+
+  it.each([
+    ['bot read isolation', { readIsolation: true }, {}, 'readIsolation'],
+    ['frozen session sandbox', {}, { sandbox: true }, 'sandbox'],
+  ] as const)(
+    'keeps %s authoritative over the Full Access marker',
+    (_name, botOverrides, sessionOverrides, expectedField) => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot(botOverrides));
+      const ds = makeHttpDs(true);
+      Object.assign(ds.session, sessionOverrides);
+
+      forkWorker(ds, 'observe travel', false);
+
+      const worker = forkMock.mock.results.at(-1)!.value;
+      const init = vi.mocked(worker.send).mock.calls[0][0];
+      expect(init).toEqual(expect.objectContaining({ [expectedField]: true }));
+    },
+  );
+
+  it('passes the host sandbox override through to the worker unchanged', () => {
+    vi.stubEnv('BOTMUX_SANDBOX', '1');
+    try {
+      forkWorker(makeHttpDs(true), 'observe travel', false);
+
+      const options = forkMock.mock.calls.at(-1)?.[2] as {
+        env?: NodeJS.ProcessEnv;
+      };
+      expect(options.env?.BOTMUX_SANDBOX).toBe('1');
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('ignores a forged Full Access marker outside an HTTP virtual session', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ apiOnly: true }));
+    const ds = makeDs();
+    ds.session.apiTaskFullAccess = true;
+
+    forkWorker(ds, 'core-only task', false);
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(init).toEqual(expect.objectContaining({ readIsolation: true }));
+  });
+});
+
 describe('session.start lifecycle integration', () => {
   it('emits session.start after forkWorker spawns a worker', () => {
     forkWorker(makeDs(), 'hello', false);

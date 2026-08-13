@@ -13,6 +13,14 @@
 
 Linux 依赖 bubblewrap（bwrap），macOS 用同一份 policy 经 Seatbelt（`sandbox-exec`）落地；两平台统一走 fs-policy 三档白名单。除 riff 外的本地后端（pty/tmux/zellij…）都会包裹。
 
+## API task Full Access
+
+少数本机工具的受支持 IPC 无法穿过文件沙盒时，owner 可在目标 bot 的
+`bots.json` 条目显式设置 `"apiTaskFullAccess": true`。该能力只冻结到此后新建的
+HTTP virtual/API-task session，不能由 `/api/trigger` 请求，普通聊天与其他 bot
+不受影响。缺省为关闭；bot/session 的 `sandbox`、bot 的 `readIsolation` 和
+host 级 `BOTMUX_SANDBOX=1` 仍优先强制隔离。
+
 ## 工作原理
 
 ```
