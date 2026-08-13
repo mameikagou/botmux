@@ -184,8 +184,23 @@ type StoreFileRef = {
   path: string;
 };
 
-function storeDbFileName(appId: string | undefined): string {
-  return appId ? `sessions-${appId}.db` : 'sessions.db';
+/** Per-bot SQLite stores live in their OWN directory
+ *  (`session-stores/<appId>/sessions.db`), not as flat sibling files: the CLI
+ *  file sandbox must bind the store as a DIRECTORY. A single-file bwrap bind
+ *  pins the inode mounted at spawn, and SQLite deletes/recreates -wal/-shm
+ *  when the last connection closes — a persistent pane surviving a daemon
+ *  restart would keep reading the dead WAL forever (or a corrupt hybrid once
+ *  checkpoints recycle it). Directory binds resolve names live, so the pane
+ *  always sees the current sidecars. The legacy no-appId store (tests /
+ *  single-bot dev) stays flat `sessions.db` — it is never sandbox-granted. */
+const PER_BOT_STORE_DIRNAME = 'session-stores';
+
+export function sessionStoreSqliteDir(appId: string, dataDir: string = config.session.dataDir): string {
+  return join(dataDir, PER_BOT_STORE_DIRNAME, appId);
+}
+
+function storeDbPath(appId: string | undefined, dataDir: string): string {
+  return appId ? join(sessionStoreSqliteDir(appId, dataDir), 'sessions.db') : join(dataDir, 'sessions.db');
 }
 function storeJsonFileName(appId: string | undefined): string {
   return appId ? `sessions-${appId}.json` : 'sessions.json';
@@ -194,31 +209,46 @@ function storeJsonFileName(appId: string | undefined): string {
 /** Per-store rule for every cross-process reader and CLI offline writer:
  *  use the .db when it exists, else the .json. */
 function resolveStoreFile(appId: string | undefined, dataDir: string): StoreFileRef {
-  const dbPath = join(dataDir, storeDbFileName(appId));
+  const dbPath = storeDbPath(appId, dataDir);
   if (existsSync(dbPath)) return { appId, kind: 'sqlite', path: dbPath };
   return { appId, kind: 'json', path: join(dataDir, storeJsonFileName(appId)) };
 }
 
-/** Group a directory listing into one ref per store identity, .db winning. */
-function storeRefsFromNames(names: readonly string[], dataDir: string): StoreFileRef[] {
-  const dbNames = new Map<string, string>();
-  const jsonNames = new Map<string, string>();
+/** One ref per store identity across the whole data dir, .db winning: flat
+ *  legacy files + per-bot JSON files + per-bot SQLite store directories.
+ *  `strict` propagates an unlistable `session-stores/` dir (fail-closed
+ *  callers must not mistake an unreadable store set for an empty one);
+ *  otherwise it degrades to the JSON view. */
+function listStoreRefs(dataDir: string, opts: { strict?: boolean } = {}): StoreFileRef[] {
+  const names = readdirSync(dataDir);
+  const dbPaths = new Map<string, string>();
+  const jsonPaths = new Map<string, string>();
   for (const name of names) {
-    if (name === 'sessions.db') dbNames.set('', name);
-    else if (name === 'sessions.json') jsonNames.set('', name);
-    else if (name.startsWith('sessions-') && name.endsWith('.db')) {
-      dbNames.set(name.slice('sessions-'.length, -'.db'.length), name);
-    } else if (name.startsWith('sessions-') && name.endsWith('.json')) {
-      jsonNames.set(name.slice('sessions-'.length, -'.json'.length), name);
+    if (name === 'sessions.db') dbPaths.set('', join(dataDir, name));
+    else if (name === 'sessions.json') jsonPaths.set('', join(dataDir, name));
+    else if (name.startsWith('sessions-') && name.endsWith('.json')) {
+      jsonPaths.set(name.slice('sessions-'.length, -'.json'.length), join(dataDir, name));
+    }
+  }
+  if (names.includes(PER_BOT_STORE_DIRNAME)) {
+    let appIds: string[] = [];
+    try {
+      appIds = readdirSync(join(dataDir, PER_BOT_STORE_DIRNAME));
+    } catch (err) {
+      if (opts.strict) throw err;
+    }
+    for (const appId of appIds) {
+      const dbPath = storeDbPath(appId, dataDir);
+      if (existsSync(dbPath)) dbPaths.set(appId, dbPath);
     }
   }
   const refs: StoreFileRef[] = [];
-  for (const key of new Set([...dbNames.keys(), ...jsonNames.keys()])) {
-    const dbName = dbNames.get(key);
+  for (const key of new Set([...dbPaths.keys(), ...jsonPaths.keys()])) {
+    const dbPath = dbPaths.get(key);
     refs.push({
       appId: key === '' ? undefined : key,
-      kind: dbName ? 'sqlite' : 'json',
-      path: join(dataDir, dbName ?? jsonNames.get(key)!),
+      kind: dbPath ? 'sqlite' : 'json',
+      path: dbPath ?? jsonPaths.get(key)!,
     });
   }
   return refs;
@@ -384,7 +414,7 @@ function getFilePath(): string {
 }
 
 function getDbPath(): string {
-  return join(config.session.dataDir, storeDbFileName(currentAppId));
+  return storeDbPath(currentAppId, config.session.dataDir);
 }
 
 function ensureDir(): void {
@@ -507,6 +537,7 @@ function load(): void {
   if (!existsSync(dbFp) && sqliteBootstrapAllowed) {
     // First start on the SQLite engine: import this store's JSON rows (or
     // create an empty store) under the same lock every JSON writer uses.
+    mkdirSync(dirname(dbFp), { recursive: true });
     withFileLockSync(jsonFp, () => {
       if (existsSync(dbFp)) return; // another owning process won the import
       const imported = importJsonStoreToSqlite(dbFp, jsonFp);
@@ -519,19 +550,34 @@ function load(): void {
   if (existsSync(dbFp)) {
     const store = attachOwnStore(dbFp);
     sessions = new Map();
-    for (const [key, value] of readOwnStoreAllRows(store)) sessions.set(key, value);
-    const repaired = repairMissingChatScopes();
-    if (repaired.length > 0) {
+    // 排他读：BEGIN IMMEDIATE 与离线 CLI 写者互斥后再取快照。纯 SELECT 不被
+    // 写事务排斥——若一个已通过双 abortIf 探测、正持有 IMMEDIATE 的离线 CLI
+    // 尚未 commit，普通读会把它提交前的旧行读进终身缓存，随后的行写回就会
+    // 覆盖掉 CLI 的提交（JSON 时代由同一把文件锁保证的 load/离线写串行化）。
+    // daemon 先发布 descriptor 再首次 load：新来的写者在探测处让位，已持锁
+    // 的写者让本读取等到它 commit 之后。
+    store.db.exec('BEGIN IMMEDIATE');
+    let committed = false;
+    try {
+      for (const [key, value] of readOwnStoreAllRows(store)) sessions.set(key, value);
+      const repaired = repairMissingChatScopes();
       try {
         for (const session of repaired) {
           store.upsert.run(session.sessionId, sessionStatusText(session), JSON.stringify(session));
         }
-        logger.info(`Repaired ${repaired.length} scope-less chat session(s) in ${dbFp}`);
+        store.db.exec('COMMIT');
+        committed = true;
+        if (repaired.length > 0) {
+          logger.info(`Repaired ${repaired.length} scope-less chat session(s) in ${dbFp}`);
+        }
       } catch (err) {
-        // Loading succeeded, so keep the in-memory sessions available even
-        // if the best-effort repair cannot be persisted yet.
+        // Loading succeeded, so keep the in-memory sessions available (with
+        // the in-memory repairs) even if the best-effort repair cannot be
+        // persisted yet.
         logger.error(`Failed to persist repaired chat session scopes: ${err}`);
       }
+    } finally {
+      if (!committed) { try { store.db.exec('ROLLBACK'); } catch { /* txn already gone */ } }
     }
     logger.info(`Loaded ${sessions.size} sessions from ${dbFp}`);
     loaded = true;
@@ -1085,11 +1131,11 @@ export function getSessionFresh(sessionId: string): Session | undefined {
  */
 function findInOtherFiles(sessionId: string): Session | undefined {
   const dataDir = config.session.dataDir;
-  let names: string[];
+  let refs: StoreFileRef[];
   try {
-    names = readdirSync(dataDir);
+    refs = listStoreRefs(dataDir);
   } catch { return undefined; }
-  for (const ref of storeRefsFromNames(names, dataDir)) {
+  for (const ref of refs) {
     if (ref.appId === currentAppId) continue;
     try {
       const hit = readStoreRowByKey(ref, sessionId);
@@ -1382,12 +1428,12 @@ export function findActiveChatScopeSessionsByChat(chatId: string): Session[] {
  * which bot owns this process — used by the restart-report DM after a restart.
  */
 export function countActiveSessionsOnDisk(dataDir: string = config.session.dataDir): number {
-  let names: string[];
+  let refs: StoreFileRef[];
   try {
-    names = readdirSync(dataDir);
+    refs = listStoreRefs(dataDir);
   } catch { return 0; /* missing dir → 0 */ }
   let n = 0;
-  for (const ref of storeRefsFromNames(names, dataDir)) {
+  for (const ref of refs) {
     try {
       if (ref.kind === 'sqlite') {
         const db = openDbForRead(ref.path);
@@ -1432,11 +1478,11 @@ export function collectBotmuxSessionIdentities(dataDir: string = config.session.
   load();
   for (const s of sessions.values()) add(s);
   // Then every bot's persisted store (other daemons own their own stores).
-  let names: string[];
+  let refs: StoreFileRef[];
   try {
-    names = readdirSync(dataDir);
+    refs = listStoreRefs(dataDir);
   } catch { return ids; /* missing dir → in-memory only */ }
-  for (const ref of storeRefsFromNames(names, dataDir)) {
+  for (const ref of refs) {
     try {
       for (const [, s] of readStoreEntries(ref)) add(s);
     } catch (err) {
@@ -1495,16 +1541,16 @@ export function loadAllSessionsSnapshot(options: {
     }
   };
   readInto(resolveStoreFile(undefined, dataDir));
-  let names: string[] | undefined;
+  let refs: StoreFileRef[];
   try {
-    names = readdirSync(dataDir);
+    refs = listStoreRefs(dataDir);
   } catch {
     if (options.fallbackAppId) {
       readInto(resolveStoreFile(options.fallbackAppId, dataDir));
     }
     return out;
   }
-  for (const ref of storeRefsFromNames(names, dataDir)) {
+  for (const ref of refs) {
     if (ref.appId) readInto(ref);
   }
   return out;
@@ -1552,9 +1598,9 @@ export function readSessionRowCopiesAcrossStores(
   sessionId: string,
   dataDir: string = config.session.dataDir,
 ): Session[] {
-  const names = readdirSync(dataDir);
+  const refs = listStoreRefs(dataDir, { strict: true });
   const matches: Session[] = [];
-  for (const ref of storeRefsFromNames(names, dataDir)) {
+  for (const ref of refs) {
     let session: Session | undefined;
     try {
       session = readStoreRowByKey(ref, sessionId);
@@ -1661,11 +1707,11 @@ function findActiveSessionsMatching(
     if (predicate(s) && s.status === 'active') matches.push(s);
   }
   const dataDir = config.session.dataDir;
-  let names: string[];
+  let refs: StoreFileRef[];
   try {
-    names = readdirSync(dataDir);
+    refs = listStoreRefs(dataDir);
   } catch { return matches; }
-  for (const ref of storeRefsFromNames(names, dataDir)) {
+  for (const ref of refs) {
     if (ref.appId === currentAppId) continue;
     try {
       for (const s of readStoreActiveRows(ref, hint)) {
