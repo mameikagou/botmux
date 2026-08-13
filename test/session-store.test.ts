@@ -62,6 +62,7 @@ vi.mock('../src/services/frozen-card-store.js', () => ({
 
 // Import the module under test after mocks are set up
 import {
+  __testOnly_setBeforeRowPersist,
   init,
   createSession,
   getSession,
@@ -85,11 +86,42 @@ function makeTempDir(): string {
   return mkdtempSync(join(tmpdir(), 'session-store-test-'));
 }
 
+// db-else-json 读盘夹具：引擎替换后，daemon store 的持久化状态落在 sessions*.db
+// （既有 JSON 冻结不再更新）；混合窗口场景仍可能只有 .json。读断言统一走这里。
+import { DatabaseSync } from 'node:sqlite';
+
+function persistedStorePath(dir: string, appId?: string): string | undefined {
+  const dbPath = join(dir, appId ? `sessions-${appId}.db` : 'sessions.db');
+  if (existsSync(dbPath)) return dbPath;
+  const jsonPath = join(dir, appId ? `sessions-${appId}.json` : 'sessions.json');
+  return existsSync(jsonPath) ? jsonPath : undefined;
+}
+
+function persistedStoreExists(dir: string, appId?: string): boolean {
+  return persistedStorePath(dir, appId) !== undefined;
+}
+
+function readPersistedRows(dir: string, appId?: string): Record<string, any> {
+  const path = persistedStorePath(dir, appId);
+  if (!path) throw new Error(`no persisted session store in ${dir} (appId=${appId ?? 'legacy'})`);
+  if (path.endsWith('.db')) {
+    const db = new DatabaseSync(path);
+    try {
+      const rows = db.prepare('SELECT session_id, row FROM sessions').all() as { session_id: string; row: string }[];
+      return Object.fromEntries(rows.map(r => [r.session_id, JSON.parse(r.row)]));
+    } finally {
+      db.close();
+    }
+  }
+  return JSON.parse(readFileSync(path, 'utf-8'));
+}
+
 // ─── Setup / Teardown ─────────────────────────────────────────────────────
 
 beforeEach(() => {
   tempDir = makeTempDir();
   fsControl.failSessionWrite = false;
+  __testOnly_setBeforeRowPersist(undefined);
   mockDeleteFrozenCards.mockReset();
   // Reset module state for each test
   init();
@@ -170,7 +202,7 @@ describe('init()', () => {
 
     expect(getSession('broken')?.scope).toBe('chat');
     expect(getSession('legacyThread')?.scope).toBeUndefined();
-    const persisted = JSON.parse(readFileSync(fp, 'utf-8'));
+    const persisted = readPersistedRows(tempDir);
     expect(persisted.broken.scope).toBe('chat');
     expect(persisted.legacyThread.scope).toBeUndefined();
   });
@@ -287,9 +319,8 @@ describe('createSession()', () => {
 
   it('should persist session to disk', () => {
     const session = createSession('chat1', 'root1', 'Persisted');
-    const fp = join(tempDir, 'sessions.json');
-    expect(existsSync(fp)).toBe(true);
-    const data = JSON.parse(readFileSync(fp, 'utf-8'));
+    expect(persistedStoreExists(tempDir)).toBe(true);
+    const data = readPersistedRows(tempDir);
     expect(data[session.sessionId]).toBeDefined();
     expect(data[session.sessionId].title).toBe('Persisted');
   });
@@ -400,7 +431,8 @@ describe('closeSession()', () => {
     session.backendType = 'riff';
     session.riffParentTaskId = 'riff-task-retry';
     updateSession(session);
-    fsControl.failSessionWrite = true;
+    // SQLite 行写不经过 node:fs，失败注入改走 store 的 test-only 钩子。
+    __testOnly_setBeforeRowPersist(() => { throw new Error('simulated session repair write failure'); });
 
     expect(() => closeSession(
       session.sessionId,
@@ -412,7 +444,7 @@ describe('closeSession()', () => {
     });
     expect(mockDeleteFrozenCards).not.toHaveBeenCalled();
 
-    fsControl.failSessionWrite = false;
+    __testOnly_setBeforeRowPersist(undefined);
     init();
     expect(getSession(session.sessionId)).toMatchObject({
       status: 'active',
@@ -506,22 +538,22 @@ describe('updateSession()', () => {
   });
 
   it('skips the disk write when an update produces byte-identical content', () => {
-    // save() does writeFile(tmp) + rename(tmp → fp), so every REAL write
-    // replaces the file's inode. A skipped write leaves the inode untouched.
-    const fp = join(tempDir, 'sessions.json');
+    // 行级写落在 WAL（append-only），每次 REAL write 都让 sessions.db-wal 变长；
+    // 被跳过的冗余写不开事务，WAL 长度保持不变。
+    const walFp = join(tempDir, 'sessions.db-wal');
     const session = createSession('chat1', 'root1', 'NoChange');
-    const inodeAfterCreate = statSync(fp).ino;
+    const walAfterCreate = statSync(walFp).size;
 
-    // A redundant update with no field change → must be skipped (inode stable).
+    // A redundant update with no field change → must be skipped (WAL stable).
     updateSession(session);
-    expect(statSync(fp).ino).toBe(inodeAfterCreate);
+    expect(statSync(walFp).size).toBe(walAfterCreate);
     updateSession(session); // and again — still no write
-    expect(statSync(fp).ino).toBe(inodeAfterCreate);
+    expect(statSync(walFp).size).toBe(walAfterCreate);
 
-    // A real change → the file is rewritten (inode changes).
+    // A real change → the row is rewritten (WAL grows).
     session.title = 'Changed';
     updateSession(session);
-    expect(statSync(fp).ino).not.toBe(inodeAfterCreate);
+    expect(statSync(walFp).size).toBeGreaterThan(walAfterCreate);
 
     // Content is still correct after the skip/write sequence.
     init();
@@ -581,8 +613,8 @@ describe('Multi-bot isolation', () => {
     init('app-beta');
     createSession('c2', 'r2', 'Beta Session');
 
-    expect(existsSync(join(tempDir, 'sessions-app-alpha.json'))).toBe(true);
-    expect(existsSync(join(tempDir, 'sessions-app-beta.json'))).toBe(true);
+    expect(persistedStoreExists(tempDir, 'app-alpha')).toBe(true);
+    expect(persistedStoreExists(tempDir, 'app-beta')).toBe(true);
   });
 
   it('should only list sessions belonging to the current appId', () => {
@@ -605,7 +637,8 @@ describe('Multi-bot isolation', () => {
   it('should use legacy sessions.json when no appId is set', () => {
     init();
     createSession('c1', 'r1', 'Legacy');
-    expect(existsSync(join(tempDir, 'sessions.json'))).toBe(true);
+    expect(persistedStoreExists(tempDir)).toBe(true);
+    expect(readPersistedRows(tempDir)).not.toEqual({});
   });
 
   it('should migrate matching sessions from legacy file to per-bot file', () => {
@@ -638,7 +671,7 @@ describe('Multi-bot isolation', () => {
     const sessions = listSessions();
     expect(sessions).toHaveLength(1);
     expect(sessions[0].title).toBe('App A Session');
-    expect(existsSync(join(tempDir, 'sessions-app-A.json'))).toBe(true);
+    expect(persistedStoreExists(tempDir, 'app-A')).toBe(true);
   });
 });
 
@@ -757,7 +790,7 @@ describe('legacy placeholder-card field stripping', () => {
     const loaded = getSession('s1')!;
     updateSession({ ...loaded, title: 'Touched' });
 
-    const onDisk = JSON.parse(readFileSync(join(tempDir, 'sessions.json'), 'utf-8'));
+    const onDisk = readPersistedRows(tempDir);
     expect(onDisk.s1.title).toBe('Touched');
     expect(onDisk.s1).not.toHaveProperty('pendingResponseCardId');
     expect(onDisk.s1).not.toHaveProperty('pendingResponseCardState');
