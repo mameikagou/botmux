@@ -940,6 +940,12 @@ export class PodmanExecutionProvider {
     const args: string[] = [
       'run',
       '--rm',
+      // The host process is attached to node-pty, but Podman does not forward
+      // that terminal into the container unless both stdin and a container PTY
+      // are requested. Interactive harnesses such as Codex otherwise observe
+      // TERM=dumb/non-TTY stdin and abort before their TUI starts.
+      '--interactive',
+      '--tty',
       '--userns=keep-id',
       `--user=${prepared.hostUid}:${prepared.hostGid}`,
       `--network=${prepared.network.networkOption}`,

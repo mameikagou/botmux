@@ -161,8 +161,10 @@ describe('PodmanExecutionProvider', () => {
       .toThrow(/secret is required/);
    const argv = launch.args.join('\n');
     expect(JSON.stringify(prepared)).not.toContain('secret-do-not-log');
-   expect(argv).not.toContain('secret-do-not-log');
+    expect(argv).not.toContain('secret-do-not-log');
     expect(argv).toContain('--rm');
+    expect(argv).toContain('--interactive');
+    expect(argv).toContain('--tty');
     expect(argv).toContain('--userns=keep-id');
     expect(argv).toContain('--network=pasta:--no-map-gw');
     expect(argv).not.toContain('18181');
