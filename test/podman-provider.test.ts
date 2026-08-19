@@ -150,7 +150,7 @@ describe('PodmanExecutionProvider', () => {
    const launch = provider.launch(prepared, {
      cliId: 'opencode',
      bin: '/usr/local/bin/opencode',
-     args: ['--version'],
+     args: ['--system-prompt', 'line one\nline two', ''],
      credentialSecret: 'secret-do-not-log',
      runtimeEnv: {
        BOTMUX_CHAT_ID: 'oc_chat_test',
@@ -177,6 +177,7 @@ describe('PodmanExecutionProvider', () => {
     expect(argv).toContain('--env=AGENT_API_KEY');
     expect(argv).toContain('--env=BOTMUX_SESSION_ID=session-api');
     expect(argv).toContain('--env=BOTMUX_CHAT_ID=oc_chat_test');
+    expect(launch.args.slice(-4)).toEqual(['--', '--system-prompt', 'line one\nline two', '']);
     expect(launch.env.AGENT_API_KEY).toBe('secret-do-not-log');
     expect(launch.env.OPENAI_API_KEY).toBeUndefined();
     expect(readFileSync(prepared.credential.providerConfig!.path, 'utf8')).not.toContain('secret-do-not-log');
@@ -195,6 +196,12 @@ describe('PodmanExecutionProvider', () => {
       credentialSecret: 'secret-do-not-log',
       runtimeEnv: { LD_PRELOAD: '/tmp/host-hook.so' },
     })).toThrow(/not allow-listed/);
+    expect(() => provider.launch(prepared, {
+      cliId: 'opencode',
+      bin: 'opencode',
+      args: ['bad\u0000arg'],
+      credentialSecret: 'secret-do-not-log',
+    })).toThrow(/without NUL/);
   });
 
   it('fails closed without frozen bindings and never falls back to a host CLI', async () => {

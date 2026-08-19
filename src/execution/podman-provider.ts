@@ -218,6 +218,16 @@ function safeArgument(value: unknown, name: string): string {
   return result;
 }
 
+function safeCliArgument(value: unknown, name: string): string {
+  if (typeof value !== 'string' || value.includes('\u0000')) {
+    fail(`${name} must be a string without NUL`);
+  }
+  // CLI argv is passed directly to Podman without a shell. Empty positional
+  // values and multiline system prompts are therefore data, not separators;
+  // rejecting them breaks valid interactive harness launches.
+  return value;
+}
+
 function safeSessionId(value: unknown): string {
   const sessionId = nonEmpty(value, 'sessionId');
   if (sessionId.length > 256) fail('sessionId is too long');
@@ -452,7 +462,7 @@ function checkCliLaunch(prepared: PreparedExecution, launch: PodmanCliLaunchSpec
   const actual = safeArgument(launch.bin, 'cliLaunchSpec.bin').split('/').pop();
   if (actual !== expected) fail(`adapter binary ${actual} is not the fixed ${expected} for ${prepared.cliId}`);
   if (!Array.isArray(launch.args)) fail('cliLaunchSpec.args must be an array');
-  return launch.args.map((arg, index) => safeArgument(arg, `cliLaunchSpec.args[${index}]`));
+  return launch.args.map((arg, index) => safeCliArgument(arg, `cliLaunchSpec.args[${index}]`));
 }
 
 function validateRuntimeEnvironment(input: PodmanCliLaunchSpec['runtimeEnv']): Record<string, string> {
