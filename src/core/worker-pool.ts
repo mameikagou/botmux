@@ -6329,6 +6329,14 @@ export function forkWorker(
   const cb = requireCallbacks();
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
+  // Freeze the execution profile at the topic/session boundary. A later bot
+  // config edit must not move an existing conversation between host and
+  // Podman, while a new Podman topic still receives the current profile.
+  const podmanExecution = ds.session.execution ?? botCfg.execution;
+  if (!ds.session.execution && botCfg.execution) {
+    ds.session.execution = botCfg.execution;
+    sessionStore.updateSession(ds.session);
+  }
   // A bare /repo placeholder (and a non-Codex empty group-join setup) owns no
   // model turn. Starting its CLI with an empty prompt must not mint a queued
   // activation token: the worker has nothing to submit and could never ACK it.
@@ -6536,16 +6544,22 @@ export function forkWorker(
   // adapter's claude-family fields, writing to each variant's own .claude.json
   // (`~/.claude.json` for claude, `.claude-runtime/.claude.json` for seed).
   const familyAdapter = createCliAdapterSync(agentCfg.cliId, agentCfg.cliPathOverride);
-  if (familyAdapter.claudeStateJsonPath) ensureClaudeFolderTrust(cwd, familyAdapter.claudeStateJsonPath);
+  // Podman owns a session-local HOME and prepares its trust/state files inside
+  // that mount; touching the daemon user's global Claude state here would
+  // violate the container path boundary before the worker even starts.
+  if (!podmanExecution && familyAdapter.claudeStateJsonPath) {
+    ensureClaudeFolderTrust(cwd, familyAdapter.claudeStateJsonPath);
+  }
   const resolvedBackendType = resolvePairedSpawnBackendType(
     agentCfg.cliId,
     ds.session.backendType,
     botCfg.backendType,
     config.daemon.backendType,
   );
-  if (ds.session.cliId !== agentCfg.cliId || ds.session.backendType !== resolvedBackendType) {
+  const effectiveResolvedBackendType = podmanExecution ? 'pty' : resolvedBackendType;
+  if (ds.session.cliId !== agentCfg.cliId || ds.session.backendType !== effectiveResolvedBackendType) {
     ds.session.cliId = agentCfg.cliId;
-    ds.session.backendType = resolvedBackendType;
+    ds.session.backendType = effectiveResolvedBackendType;
     sessionStore.updateSession(ds.session);
   }
 
@@ -6808,7 +6822,7 @@ export function forkWorker(
     model: agentCfg.model,
     reasoningEffort: agentCfg.reasoningEffort,
     disableCliBypass: botCfg.disableCliBypass === true,
-    codexRpcInput: botCfg.codexRpcInput === true || config.codexRpcInputDefault,
+    codexRpcInput: !podmanExecution && (botCfg.codexRpcInput === true || config.codexRpcInputDefault),
     // Startup commands run on every fresh spawn (incl. resume) so session-only
     // settings like `/effort ultracode` are re-established. Adopt sessions are
     // observed, not driven — forkAdoptWorker intentionally omits this.
@@ -6848,11 +6862,16 @@ export function forkWorker(
     // the real persistent pane (the stamp is written below; restore reads it via
     // getSessionPersistentBackendType). A brand-new session (no stamp) resolves
     // from live config, so a dashboard backend switch only affects NEW sessions.
-    backendType: resolvePairedSpawnBackendType(agentCfg.cliId, ds.session.backendType, botCfg.backendType, config.daemon.backendType),
+    backendType: podmanExecution
+      ? 'pty'
+      : resolvePairedSpawnBackendType(agentCfg.cliId, ds.session.backendType, botCfg.backendType, config.daemon.backendType),
     // Shared Herdr is not derivable from sessionId: preserve the exact host +
     // managed-agent affinity across daemon/worker replacement.
     persistentBackendTarget: ds.session.persistentBackendTarget,
     backendConfig: botCfg.riff,
+    ...(podmanExecution ? { execution: podmanExecution } : {}),
+    ...(ds.session.principalBinding ? { principalBinding: ds.session.principalBinding } : {}),
+    ...(ds.session.credentialBinding ? { credentialBinding: ds.session.credentialBinding } : {}),
     riffParentTaskId: ds.session.riffParentTaskId,
     riffRepoDirs: ds.session.riffRepoDirs,
     deferredScheduleRun: ds.session.deferredScheduleRun,

@@ -143,7 +143,7 @@ describe('Podman credential and mount plans', () => {
     });
     const mounts = buildPodmanMountPlan(config(), runtime, injection);
     expect(mounts.some(mount => mount.kind === 'codex-auth')).toBe(false);
-    expect(injection.providerConfig?.path).toBe(`${runtime.homeRoot}/.claude/botmux-provider.json`);
+    expect(injection.providerConfig?.path).toBe(`${runtime.homeRoot}/.agent/providers/claude.json`);
     expect(injection.secretEnvVar).toBe('ANTHROPIC_API_KEY');
     expect(JSON.stringify(injection)).not.toContain('sk-test');
     expect(materializeCredentialEnvironment(injection, 'sk-test')).toMatchObject({

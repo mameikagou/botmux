@@ -459,28 +459,28 @@ function credentialContract(cliId: PodmanCliId): {
         secretEnvVar: 'OPENAI_API_KEY',
         baseUrlEnvVar: 'OPENAI_BASE_URL',
         modelEnvVar: 'OPENAI_MODEL',
-        configRelativePath: '.codex/botmux-provider.json',
+        configRelativePath: '.agent/providers/codex.json',
       };
     case 'claude-code':
       return {
         secretEnvVar: 'ANTHROPIC_API_KEY',
         baseUrlEnvVar: 'ANTHROPIC_BASE_URL',
         modelEnvVar: 'ANTHROPIC_MODEL',
-        configRelativePath: '.claude/botmux-provider.json',
+        configRelativePath: '.agent/providers/claude.json',
       };
     case 'pi':
       return {
         secretEnvVar: 'BOTMUX_API_KEY',
         baseUrlEnvVar: 'BOTMUX_BASE_URL',
         modelEnvVar: 'BOTMUX_MODEL',
-        configRelativePath: '.pi/agent/botmux-provider.json',
+        configRelativePath: '.agent/providers/pi.json',
       };
     case 'opencode':
       return {
         secretEnvVar: 'BOTMUX_API_KEY',
         baseUrlEnvVar: 'BOTMUX_BASE_URL',
         modelEnvVar: 'BOTMUX_MODEL',
-        configRelativePath: '.config/opencode/botmux-provider.json',
+        configRelativePath: '.agent/providers/opencode.json',
       };
   }
 }

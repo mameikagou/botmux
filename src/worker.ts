@@ -355,6 +355,11 @@ import {
   projectRuntimeScreenStatus,
 } from './utils/runtime-screen-status.js';
 import { AsyncSerialQueue } from './utils/async-serial-queue.js';
+import {
+  PodmanExecutionProvider,
+  fixedPodmanCliBinary,
+  type PreparedExecution,
+} from './execution/podman-provider.js';
 
 // A worker must never trust an INHERITED session-level CLI home pointer
 // (CLAUDE_CONFIG_DIR / CODEX_HOME): a stale pm2 dump can resurrect the daemon
@@ -445,6 +450,32 @@ scrubClaudeSessionMarkerEnv(process.env);
 
 let cliAdapter: CliAdapter | null = null;
 let backend: SessionBackend | null = null;
+/** Present only for a frozen T5 execution session. Never used for host CLIs. */
+let podmanExecutionProvider: PodmanExecutionProvider | null = null;
+let podmanPreparedExecution: PreparedExecution | null = null;
+let podmanStopPromise: Promise<void> | null = null;
+let workerExitPromise: Promise<void> | null = null;
+
+function stopPreparedPodmanExecution(): void {
+  if (!podmanExecutionProvider || !podmanPreparedExecution || podmanStopPromise) return;
+  const provider = podmanExecutionProvider;
+  const prepared = podmanPreparedExecution;
+  // Defer the synchronous default runner by one microtask so killCli() keeps
+  // its existing non-blocking teardown contract; restart/close paths await the
+  // recorded promise before launching or exiting.
+  const task = Promise.resolve().then(() => provider.stop(prepared)).catch(err => {
+    log(`Podman stop failed: ${(err as Error).message}`);
+  });
+  const settled = task.finally(() => {
+    if (podmanStopPromise === settled) podmanStopPromise = null;
+  });
+  podmanStopPromise = settled;
+}
+
+async function waitForPodmanStop(): Promise<void> {
+  if (!podmanStopPromise) return;
+  await podmanStopPromise;
+}
 let backendScreenRevision = 0;
 let idleScreenSettleTask: {
   backend: SessionBackend;
@@ -11219,6 +11250,10 @@ async function spawnCli(
   opts: { pluginGenerationPrepared?: boolean } = {},
 ): Promise<void> {
   const spawnGeneration = ++cliSpawnGeneration;
+  // A restart can begin a replacement before Podman has finished stopping the
+  // old `--name`d container. Serialize that boundary so a cold resume cannot
+  // race its predecessor and accidentally trigger a name collision.
+  if (podmanStopPromise) await waitForPodmanStop();
   // Prefer force-clear so a half-finished rename cannot block the new generation.
   forceClearSessionRenameInFlight();
   currentCliCredentialIsolated = false;
@@ -11396,6 +11431,36 @@ async function spawnCli(
   }
 
   cliAdapter = createCliAdapterSync(cfg.cliId as any, cfg.cliPathOverride);
+  const podmanExecution = cfg.execution !== undefined;
+  if (podmanExecution) {
+    if (cfg.adoptMode) {
+      throw new Error('Podman execution cannot adopt a host terminal');
+    }
+    if (cfg.wrapperCli) {
+      throw new Error('Podman execution does not accept wrapperCli; the image entrypoint owns the fixed harness');
+    }
+    podmanExecutionProvider = new PodmanExecutionProvider(cfg.execution!);
+    podmanPreparedExecution = await podmanExecutionProvider.prepare({
+      sessionId: cfg.sessionId,
+      cliId: cfg.cliId,
+      expectedLarkAppId: cfg.larkAppId,
+      expectedOwnerOpenId: cfg.ownerOpenId,
+      principalBinding: cfg.principalBinding,
+      credentialBinding: cfg.credentialBinding,
+    });
+    // Every host-side transcript/resume probe must see the same clone and home
+    // that the container binds. The CLI itself receives the container paths in
+    // buildArgs and --workdir below.
+    cfg.workingDir = podmanPreparedExecution.hostWorkingDir;
+    if (cfg.cliId === 'codex') {
+      process.env.CODEX_HOME = join(podmanPreparedExecution.runtime.homeRoot, '.codex');
+    } else if (cfg.cliId === 'claude-code') {
+      process.env.CLAUDE_CONFIG_DIR = join(podmanPreparedExecution.runtime.homeRoot, '.claude');
+    }
+  } else {
+    podmanExecutionProvider = null;
+    podmanPreparedExecution = null;
+  }
   // backendType trust-but-verify + HARD GATE (PTY 退役): an explicit per-bot
   // config (or BACKEND_TYPE env override) bypasses config.ts's default, so the
   // worker re-probes the requested persistent backend here. A requested
@@ -11410,7 +11475,10 @@ async function spawnCli(
   // (PR#249), so it is exempt from the gate. tmux/zellij use disposable
   // sessions; ZMX validates its version plus full-list control plane; Herdr
   // uses a non-destructive version check.
-  let effectiveBackend = cfg.backendType;
+  // Podman wraps the existing direct PTY transport. Persistent host muxes are
+  // intentionally not reused: a tmux server would retain secret-bearing env
+  // outside the container and could reattach a different command.
+  let effectiveBackend = podmanExecution ? 'pty' : cfg.backendType;
   const backendCliError = backendCliCompatibilityError(effectiveBackend, cfg.cliId as CliId);
   if (backendCliError) {
     throw new Error(
@@ -11603,7 +11671,13 @@ async function spawnCli(
   // forks (Seed → `.claude-runtime`), undefined for everything else. Every
   // JSONL/pid/bridge gate below keys off it instead of `cliId === 'claude-code'`,
   // so a fork inherits the whole submit-confirm + bridge-fallback machinery.
-  let claudeDataDir = cliAdapter.claudeDataDir;
+  let claudeDataDir = podmanPreparedExecution && cliAdapter.claudeDataDir
+    ? join(podmanPreparedExecution.runtime.homeRoot, '.claude')
+    : cliAdapter.claudeDataDir;
+  // Claude hashes its in-container cwd into the transcript project directory.
+  // The host clone has a different absolute prefix, so all transcript/resume
+  // probes must use the same `/workspace/analyze` path that the container sees.
+  const cliTranscriptWorkingDir = podmanPreparedExecution?.containerWorkingDir ?? cfg.workingDir;
   let effectiveReadyHookInstall: HookInstallConfig | undefined = cliAdapter.hookInstall;
   // ── UNIFIED file sandbox (fs-policy, 2026-07-16 refactor) ──
   // ONE toggle, BOTH platforms, identical three-tier deny-by-default semantics
@@ -11612,11 +11686,14 @@ async function spawnCli(
   // BOTS_CONFIG. riff runs in its own REMOTE sandbox with no local CLI process —
   // local confinement is meaningless there and must be bypassed on ALL
   // platforms, or a sandbox-enabled bot bricks the moment it switches to riff.
-  const riffRemoteBackend = !localSandboxApplies(effectiveBackendType);
+  // Podman is already the process boundary; host bwrap/Seatbelt credential
+  // wrappers must not wrap the Podman client and accidentally expose a host
+  // CLI fallback or a second, differently scoped filesystem policy.
+  const riffRemoteBackend = podmanExecution || !localSandboxApplies(effectiveBackendType);
   if (riffRemoteBackend && (cfg.sandbox === true || cfg.readIsolation === true)) {
     log('Sandbox flag set but backend is riff (remote sandbox, no local process) — local sandbox bypassed');
   }
-  const sandboxRequested = !riffRemoteBackend
+  const sandboxRequested = !podmanExecution && !riffRemoteBackend
     && (cfg.sandbox === true || cfg.readIsolation === true || sandboxEnabled());
   const backendIsolationGate = backendSandboxCompatibilityError({
     backendType: effectiveBackendType,
@@ -11697,7 +11774,9 @@ async function spawnCli(
         sessionDataDir: canonicalPolicyPath(isolationRuntimeDataDir),
         currentAppId: cfg.larkAppId,
         cliId: cfg.cliId,
-        resolvedBin: canonicalPolicyPath(cliAdapter.resolvedBin),
+        resolvedBin: canonicalPolicyPath(
+          podmanExecution ? fixedPodmanCliBinary(cfg.cliId) : cliAdapter.resolvedBin,
+        ),
       })
     : undefined;
   const managedOriginChannelRequired = willReadIsolate
@@ -12101,7 +12180,7 @@ async function spawnCli(
   // The plugin set is stable only for the lifetime of one real CLI process.
   // A warm worker reattach keeps the existing Gateway and catalog untouched;
   // every fresh/resumed CLI spawn atomically refreshes both from current Bot config.
-  if (!willReattachPersistent) {
+  if (!willReattachPersistent && !podmanExecution) {
     mcpRuntimeManifest = opts.pluginGenerationPrepared
       ? readSessionMcpRuntimeManifest(cfg.sessionId, config.session.dataDir)
       : await prepareCliPluginGenerationAndGateway(cfg, cliAdapter);
@@ -12151,7 +12230,7 @@ async function spawnCli(
   if (effectiveResume && !willReattachPersistent && claudeDataDir) {
     const resumeSessionId = effectiveCliSessionId ?? effectiveAdapterSessionId;
     try {
-      const synced = syncClaudeResumeTargetToCwd(resumeSessionId, cfg.workingDir, claudeDataDir);
+      const synced = syncClaudeResumeTargetToCwd(resumeSessionId, cliTranscriptWorkingDir, claudeDataDir);
       if (synced.copied && synced.sourcePath) {
         log(`Claude resume transcript synced for cwd change: ${synced.sourcePath} → ${synced.targetPath}`);
       }
@@ -12177,7 +12256,7 @@ async function spawnCli(
     const probe = cliAdapter.checkResumeTargetExists?.({
       sessionId: effectiveAdapterSessionId,
       cliSessionId: effectiveCliSessionId,
-      workingDir: cfg.workingDir,
+      workingDir: cliTranscriptWorkingDir,
       dataDir: claudeDataDir,
       stateDbPath: hermesResumeStateDbPath,
     });
@@ -12197,7 +12276,7 @@ async function spawnCli(
     // sessionId (fresh spawn creates <newSid>.jsonl, not the old one).
     if (claudeDataDir) {
       (backend as TmuxBackend | PtyBackend | ZellijBackend).claudeJsonlPath =
-        claudeJsonlPathForSession(effectiveAdapterSessionId, cfg.workingDir, claudeDataDir);
+        claudeJsonlPathForSession(effectiveAdapterSessionId, cliTranscriptWorkingDir, claudeDataDir);
     }
     // Single human-visible warning. Spam guard: at most once per worker
     // lifecycle (a 4× crash loop otherwise duplicates the notice).
@@ -12223,7 +12302,7 @@ async function spawnCli(
       ? (effectiveCliSessionId ?? effectiveAdapterSessionId)
       : effectiveAdapterSessionId;
     (backend as TmuxBackend | PtyBackend | ZellijBackend).claudeJsonlPath =
-      claudeJsonlPathForSession(bridgeWatchId, cfg.workingDir, claudeDataDir);
+      claudeJsonlPathForSession(bridgeWatchId, cliTranscriptWorkingDir, claudeDataDir);
   }
   // Publish the resolved resume semantics so any late-attach timer (hermes,
   // cursor, …) driven by codexBridgeStartTimer sees the SAME mode the spawn
@@ -12344,7 +12423,9 @@ async function spawnCli(
   // root (only canonical /data00/... is bound), so the CLI's chdir/readlink
   // ENOENTs and it aborts with "No such file or directory (os error 2)". Off
   // sandbox this is a no-op (same dir); best-effort if unresolvable.
-  const buildArgsWorkingDir = sandboxRequested
+  const buildArgsWorkingDir = podmanPreparedExecution
+    ? podmanPreparedExecution.containerWorkingDir
+    : sandboxRequested
     ? (() => { try { return realpathSync(cfg.workingDir); } catch { return cfg.workingDir; } })()
     : cfg.workingDir;
   const args = cliAdapter.buildArgs({
@@ -12422,10 +12503,11 @@ async function spawnCli(
   // `Spawning: <new bin>` in that case is misleading and has cost real
   // debugging time. (CliId-mismatch reattach is now blocked upstream in
   // restoreActiveSessions / killStalePids.)
+  const requestedCliBin = podmanExecution ? fixedPodmanCliBinary(cfg.cliId) : cliAdapter.resolvedBin;
   if (willReattachPersistent) {
-    log(`Re-attaching to existing ${effectiveBackendType} session: ${persistentSessionName} (requested CLI: ${cliAdapter.resolvedBin})`);
+    log(`Re-attaching to existing ${effectiveBackendType} session: ${persistentSessionName} (requested CLI: ${requestedCliBin})`);
   } else {
-    log(`Spawning fresh CLI: ${cliAdapter.resolvedBin} ${args.join(' ')} (cwd: ${cfg.workingDir})`);
+    log(`Spawning fresh CLI: ${requestedCliBin} ${args.join(' ')} (cwd: ${cfg.workingDir})`);
 
     // Pre-flight the ACTUAL launch dependency, not merely adapter.resolvedBin:
     // wrapperCli replaces that binary, while Codex App / Mir use a bundled Node
@@ -12433,7 +12515,7 @@ async function spawnCli(
     // make init continue and emit a false `ready`; throwing routes the failure
     // through the daemon's user-visible init-error path and prevents an orphaned
     // "starting" card with no CLI behind it.
-    const unavailable = effectiveBackendType === 'riff'
+    const unavailable = podmanExecution || effectiveBackendType === 'riff'
       ? undefined
       : cliUnavailableMessage({
           cliId: cfg.cliId as CliId,
@@ -12457,6 +12539,9 @@ async function spawnCli(
   // namespaced BOTMUX_LARK_APP_ID injected below; the worker keeps its own
   // bare creds (forkWorker) for lark-upload. See utils/child-env.ts.
   const childEnv = redactChildEnv(process.env);
+  // Podman launches use a separately constructed allow-list. Legacy host
+  // launches continue to use childEnv exactly as before.
+  let spawnEnv: Record<string, string> = { ...childEnv } as Record<string, string>;
   if (sessionMcpGatewayHost) {
     childEnv[MCP_GATEWAY_SOCKET_ENV] = sessionMcpGatewayHost.socketPath;
     childEnv[MCP_GATEWAY_REQUIRED_ENV] = '1';
@@ -12647,7 +12732,10 @@ async function spawnCli(
   // per-session project copy + de-identified config. The agent's `botmux send`
   // routes through a daemon-side outbox watcher (creds never enter the sandbox).
   // PTY backend only for the spike; falls back to direct spawn on any failure.
-  let spawnBin = cliAdapter.resolvedBin;
+  // The Podman image owns the fixed harness binary. Do not resolve a host CLI
+  // before handing the adapter argv to the container, because the host may
+  // intentionally have no Codex/Claude/Pi/OpenCode installation at all.
+  let spawnBin = podmanExecution ? fixedPodmanCliBinary(cfg.cliId) : cliAdapter.resolvedBin;
   let spawnArgs = args;
   let spawnCwd = cfg.workingDir;
 
@@ -13137,6 +13225,20 @@ async function spawnCli(
       log(`Sandbox ON (${cfg.cliId}, fs-policy ${policy.rules.length} rules): outbox=${sbx.outbox}`);
     }
   }
+  if (podmanExecution && podmanPreparedExecution) {
+    // The container uses the same validated relay protocol as bwrap, but its
+    // outbox is the T4 runtime mount rather than SESSION_DATA_DIR/sandboxes.
+    // Keep the watcher host-side so no Lark credential enters the container.
+    if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+    sandboxRelayOutbox = podmanPreparedExecution.runtime.outboxRoot;
+    sandboxStopWatcher = startOutboxWatcher(
+      sandboxRelayOutbox,
+      childEnv,
+      cfg.sessionId,
+      { authorize: authorizeManagedSend },
+    );
+    publishSandboxRelayCapability();
+  }
   // Fresh sandboxed spawn on a persistent backend: stamp the pane with this
   // daemon's boot id so a later reattach can be trusted (see the stale-pane
   // guard above). pty needs no marker (never reattached).
@@ -13370,6 +13472,36 @@ async function spawnCli(
     );
   }
 
+  if (podmanPreparedExecution && podmanExecutionProvider) {
+    const podmanLaunch = podmanExecutionProvider.launch(podmanPreparedExecution, {
+      cliId: cfg.cliId,
+      bin: spawnBin,
+      args: spawnArgs,
+      credentialSecret: cfg.credentialSecret,
+      runtimeEnv: {
+        BOTMUX_CHAT_ID: cfg.chatId,
+        BOTMUX_CHAT_TYPE: cfg.chatType,
+        BOTMUX_LARK_APP_ID: cfg.larkAppId,
+        BOTMUX_ROOT_MESSAGE_ID: cfg.rootMessageId?.startsWith('om_') ? cfg.rootMessageId : undefined,
+        BOTMUX_TURN_ID: cfg.turnId,
+        BOTMUX_DISPATCH_ATTEMPT: cfg.dispatchAttempt === undefined ? undefined : String(cfg.dispatchAttempt),
+        BOTMUX_API_ONLY: cfg.apiOnly ? '1' : undefined,
+        BOTMUX_BRAND: cfg.brand,
+        BOTMUX_USAGE_DISPLAY: resolveUsageDisplay(cfg.larkAppId),
+        BOTMUX_DAEMON_IPC_PORT: process.env.BOTMUX_DAEMON_IPC_PORT,
+        BOTMUX_SESSION_SCOPE: cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat',
+      },
+    });
+    spawnBin = podmanLaunch.bin;
+    spawnArgs = [...podmanLaunch.args];
+    spawnCwd = podmanLaunch.cwd;
+    spawnEnv = { ...podmanLaunch.env };
+    // The Podman argv is already the complete transport command. Do not let
+    // legacy per-bot env, launchShell, wrappers, or host sandbox wrappers
+    // re-enter the process boundary.
+    capturedSpawnCommand = null;
+  }
+
   // Dashboard「复现命令」：算出本次冷启的**近似**可复现命令（bin + argv + cwd +
   // 权威注入 env），随 ready 上报、只驻 daemon 内存（含凭证，绝不落盘）。基础 CLI
   // bin/args 取 sandbox 包装前的快照，最终形态（含/不含 wrapperCli）由
@@ -13403,17 +13535,17 @@ async function spawnCli(
   // proof, not a backend's prediction flag.
   try {
     if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
-    prepareFreshCodexAppControlBootstrap(cfg, !!persistentSessionName);
-    if (codexAppControlBootstrapPathForSpawn) {
+    if (!podmanExecution) prepareFreshCodexAppControlBootstrap(cfg, !!persistentSessionName);
+    if (!podmanExecution && codexAppControlBootstrapPathForSpawn) {
       childEnv[CODEX_APP_CONTROL_BOOTSTRAP_ENV] = codexAppControlBootstrapPathForSpawn;
     }
     backend.spawn(spawnBin, spawnArgs, {
       cwd: spawnCwd,
       cols: PTY_COLS,
       rows: PTY_ROWS,
-      env: childEnv as Record<string, string>,
-      injectEnv: perBotInjectKeys.length ? perBotInjectEnv : undefined,
-      launchShell: lastInitConfig?.launchShell,
+      env: spawnEnv,
+      injectEnv: podmanExecution ? undefined : (perBotInjectKeys.length ? perBotInjectEnv : undefined),
+      launchShell: podmanExecution ? undefined : lastInitConfig?.launchShell,
     });
   } catch (err) {
     cleanupCodexAppControlBootstrap();
@@ -13507,8 +13639,8 @@ async function spawnCli(
       schedule: (fn, ms) => { setTimeout(fn, ms); },
     });
   };
-  if (cliPid) startWrapperRealPidResolve(cliPid);
-  if (cliPid) observeCursorCliSessionId(cliPid);
+  if (cliPid && !podmanExecution) startWrapperRealPidResolve(cliPid);
+  if (cliPid && !podmanExecution) observeCursorCliSessionId(cliPid);
 
   // File sandbox / Linux credential-only bwrap launches `bwrap --unshare-pid --
   // traex`, so the pane leaf (getChildPid) is the bwrap SUPERVISOR — its
@@ -13560,7 +13692,8 @@ async function spawnCli(
   // lookup will surface here, but in-pane `/clear` won't. The pinned
   // claudeJsonlPath above is still the initial guess; the resolver corrects
   // it on first write when Claude was started with `--resume`.
-  if (cliPid && (claudeDataDir || cfg.cliId === 'grok' || cfg.cliId === 'traex' || cfg.cliId === 'reasonix')) {
+  if (cliPid && !podmanExecution
+      && (claudeDataDir || cfg.cliId === 'grok' || cfg.cliId === 'traex' || cfg.cliId === 'reasonix')) {
     // TRAE under outer bwrap: best-effort immediate resolve (leaf may already be
     // forked), then a bounded retry below covers the not-yet-forked case.
     const wiredPid = cfg.cliId === 'traex' ? resolveTraexOwnershipPid(cliPid, outerBwrapActive) : cliPid;
@@ -13630,10 +13763,10 @@ async function spawnCli(
   // fallbacks that fire for non-Claude CLIs (below).
   if (claudeDataDir && effectiveAdapterSessionId) {
     const claudeBridgeSessionId = effectiveCliSessionId ?? effectiveAdapterSessionId;
-    const claudeJsonl = claudeJsonlPathForSession(claudeBridgeSessionId, cfg.workingDir, claudeDataDir);
+    const claudeJsonl = claudeJsonlPathForSession(claudeBridgeSessionId, cliTranscriptWorkingDir, claudeDataDir);
     startBridgeWatcher(claudeJsonl, {
-      cliPid: cliPid ?? undefined,
-      cliCwd: cfg.workingDir,
+      cliPid: podmanExecution ? undefined : cliPid ?? undefined,
+      cliCwd: cliTranscriptWorkingDir,
       mode: effectiveResume ? 'baseline-existing' : 'fresh-empty',
       dataDir: claudeDataDir,
     });
@@ -14205,6 +14338,10 @@ function killCli(opts: {
   tuiPromptBlocking = false;
   stopScreenUpdates();
   backend?.kill();
+  // PTY teardown normally causes `--rm` to reap the container. Stop is still
+  // issued explicitly so a wedged child cannot leave a running container;
+  // provider.stop keeps the runtime directories for resume.
+  stopPreparedPodmanExecution();
   backend = null;
   // Tear down the bridge watcher (if any). spawnCli will rebuild it on
   // restart with the proper mode based on the new cfg. Leaving it running
@@ -15801,6 +15938,8 @@ async function sendFatalWorkerErrorAndExit(
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
   });
   log('Fatal worker error delivered; exiting process');
+  stopPreparedPodmanExecution();
+  await waitForPodmanStop();
   if (opts.hardExit) {
     // A fail-closed Codex App generation must produce a real OS-level worker
     // exit so the daemon can arm its worker-generation receipt fence. On some
@@ -16826,6 +16965,7 @@ process.on('message', async (raw: unknown) => {
         catch { /* logged by backend */ }
       }
       killCli();
+      await waitForPodmanStop();
       // Bridge marker file outlives a single CLI process (we keep it across
       // restarts so a mid-flight send is still credited), but a real close
       // tears down the session — purge the file so a future re-use of the
@@ -16845,6 +16985,7 @@ process.on('message', async (raw: unknown) => {
       // tasks survive for reattach, while PTY keeps its existing cold-resume
       // behavior because its kill() owns the child process.
       killCli({ preserveSandbox: true });
+      await waitForPodmanStop();
       cleanup();
       await flushTransferDetachAck(msg.requestId);
       // NOTE: process.exit(0) can wedge in node-pty's native teardown when a
@@ -16938,6 +17079,7 @@ process.on('message', async (raw: unknown) => {
       intentionalRestartBackend = backend;
       stopScreenshotLoop();
       killCli();
+      await waitForPodmanStop();
       cleanup();
       process.exit(0);
     }
@@ -16998,6 +17140,7 @@ process.on('message', async (raw: unknown) => {
       stopBridgeWatcher();
       stopCodexBridge();
       killCli();
+      await waitForPodmanStop();
       clearSendMarkers();
       cleanup();
       process.exit(0);
@@ -17062,6 +17205,8 @@ process.on('message', async (raw: unknown) => {
       try {
         (backend?.destroySession ?? backend?.kill)?.call(backend);
       } catch { /* best-effort */ }
+      stopPreparedPodmanExecution();
+      await waitForPodmanStop();
       backend = null;
       isPromptReady = false;
       // Suspend INTENDS to resume later: keep the per-session sandbox tree (the
@@ -17113,10 +17258,47 @@ function cleanup(): void {
   releaseCodexAppPosixOwnerLease();
 }
 
-process.on('SIGTERM', () => { stopScreenshotLoop(); killCli(); cleanup(); process.exit(0); });
-process.on('SIGINT', () => { stopScreenshotLoop(); killCli(); cleanup(); process.exit(0); });
+type WorkerExitOptions = {
+  readonly crash?: boolean;
+  readonly skipCliKill?: boolean;
+  readonly preserveSandbox?: boolean;
+};
+
+// Process-level exits await the Podman stop fence; process.on('exit') below
+// remains the synchronous last resort for an already-aborting Node process.
+function requestWorkerExit(exitCode: number, options: WorkerExitOptions = {}): void {
+  if (workerExitPromise) return;
+  workerExitPromise = (async () => {
+    stopScreenshotLoop();
+    if (options.skipCliKill) {
+      stopPreparedPodmanExecution();
+    } else {
+      try { killCli({ preserveSandbox: options.preserveSandbox }); } catch { /* best-effort */ }
+      // killCli() normally owns the stop request; repeat it if a teardown hook
+      // threw before reaching the provider.
+      stopPreparedPodmanExecution();
+    }
+    await waitForPodmanStop();
+    if (options.crash) {
+      try { teardownSandboxBestEffort(); } catch { /* best-effort */ }
+    }
+    try { cleanup(); } catch { /* best-effort */ }
+    process.exit(exitCode);
+  })().catch((error) => {
+    try { log(`Worker exit cleanup failed: ${error instanceof Error ? error.message : String(error)}`); } catch { /* */ }
+    try {
+      if (podmanExecutionProvider && podmanPreparedExecution) {
+        podmanExecutionProvider.stopSyncBestEffort(podmanPreparedExecution);
+      }
+    } catch { /* best-effort */ }
+    process.exit(exitCode);
+  });
+}
+
+process.on('SIGTERM', () => { requestWorkerExit(0); });
+process.on('SIGINT', () => { requestWorkerExit(0); });
 // If parent daemon dies, IPC channel closes — clean up
-process.on('disconnect', () => { log('Daemon disconnected'); stopScreenshotLoop(); killCli(); cleanup(); process.exit(0); });
+process.on('disconnect', () => { log('Daemon disconnected'); requestWorkerExit(0); });
 
 // Watchdog: belt-and-braces parent-death detection. SIGTERM and 'disconnect'
 // should both reach us when the daemon dies, but if main thread is stuck in
@@ -17133,11 +17315,8 @@ const ORIGINAL_PARENT_PID = process.ppid;
 setInterval(() => {
   const currentPpid = process.ppid;
   if (currentPpid !== ORIGINAL_PARENT_PID || currentPpid === 1) {
-    log(`Watchdog: parent pid changed (${ORIGINAL_PARENT_PID} → ${currentPpid}) — daemon died, exiting`);
-    stopScreenshotLoop();
-    try { killCli(); } catch { /* best-effort */ }
-    try { cleanup(); } catch { /* best-effort */ }
-    process.exit(0);
+    log(`Watchdog: parent pid changed (${ORIGINAL_PARENT_PID} -> ${currentPpid}) - daemon died, exiting`);
+    requestWorkerExit(0);
   }
 }, 30_000).unref();
 
@@ -17168,6 +17347,11 @@ function teardownSandboxBestEffort(): void {
 // the guard before any further stdout writes (log() writes to process.stdout).
 installStdioEpipeGuard();
 process.on('exit', () => {
+  // Async handlers normally await provider.stop(); this synchronous call is
+  // the final guard when Node is already entering its non-awaitable exit hook.
+  if (podmanExecutionProvider && podmanPreparedExecution) {
+    podmanExecutionProvider.stopSyncBestEffort(podmanPreparedExecution);
+  }
   // `zmx tail` can remain blocked with PPID=1 after an abrupt Node exit because
   // it notices a broken stdout pipe only when new session output arrives.
   // Detach the observer synchronously; never destroy the persistent CLI here.
@@ -17183,16 +17367,12 @@ process.on('uncaughtException', (err: NodeJS.ErrnoException) => {
   // session — the stdio guard handles those it can; this is the backstop.
   if (isIgnorableStreamError(err)) return;
   try { log(`Uncaught exception — tearing down sandbox before exit: ${err?.stack ?? err}`); } catch { /* */ }
-  teardownSandboxBestEffort();
-  try { cleanup(); } catch { /* */ }
-  process.exit(1);
+  requestWorkerExit(1, { crash: true, skipCliKill: true });
 });
 process.on('unhandledRejection', (reason: any) => {
   if (isIgnorableStreamError(reason)) return;
   try { log(`Unhandled rejection — tearing down sandbox before exit: ${reason?.stack ?? reason}`); } catch { /* */ }
-  teardownSandboxBestEffort();
-  try { cleanup(); } catch { /* */ }
-  process.exit(1);
+  requestWorkerExit(1, { crash: true, skipCliKill: true });
 });
 
 log('Worker started, waiting for init...');
