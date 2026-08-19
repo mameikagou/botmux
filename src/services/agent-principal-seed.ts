@@ -13,6 +13,48 @@ export interface SeedPrincipalRow {
 
 function validOpenId(value: string): boolean { return /^ou_[A-Za-z0-9]+$/u.test(value); }
 
+const MAPPING_SEPARATOR = '\0';
+
+function mappingError(message: string): never {
+  throw new Error(`invalid --map mapping: ${message}`);
+}
+
+/**
+ * Validate the internal composite mapping key before any row is built.  The
+ * CLI turns `app:raw` into `app\0raw`; keeping that representation exact is
+ * important because a mapping must apply to one app and one raw config value,
+ * not to every app that happens to contain the same value.
+ */
+function validateUserOpenIdMappings(
+  mappings: ReadonlyMap<string, string> | undefined,
+  configuredApps: ReadonlySet<string>,
+): Map<string, string> {
+  const validated = new Map<string, string>();
+  for (const [key, mapped] of mappings ?? []) {
+    if (typeof key !== 'string') mappingError('key must be <larkAppId>\\0<raw-config-value>');
+    if (typeof mapped !== 'string' || !validOpenId(mapped)) {
+      mappingError('target must be an app-scoped open_id (ou_...)');
+    }
+    const split = key.indexOf(MAPPING_SEPARATOR);
+    if (split <= 0 || split !== key.lastIndexOf(MAPPING_SEPARATOR) || split === key.length - 1) {
+      mappingError('key must be <larkAppId>\\0<non-empty raw-config-value>');
+    }
+    const appId = key.slice(0, split);
+    const raw = key.slice(split + 1);
+    if (appId.trim() !== appId || appId === '') mappingError('key contains an invalid app id');
+    if (raw.trim() === '') mappingError('raw config value must not be empty');
+    if (!configuredApps.has(appId)) {
+      mappingError(`app is absent from bots config: ${appId}`);
+    }
+    const existing = validated.get(key);
+    if (existing !== undefined && existing !== mapped) {
+      mappingError(`conflicting values for ${appId}:${raw}`);
+    }
+    validated.set(key, mapped);
+  }
+  return validated;
+}
+
 /**
  * Build a strict seed list from the exact app-scoped IDs already in bots.json.
  * No union/contact lookup is attempted. Owner OpenIDs must be supplied
@@ -30,17 +72,29 @@ export function buildPrincipalSeedRows(input: {
 }): SeedPrincipalRow[] {
   const rows: SeedPrincipalRow[] = [];
   const seen = new Set<string>();
-  const configuredApps = new Set(input.bots.map(bot => bot.larkAppId.trim()).filter(Boolean));
+  const configuredApps = new Set<string>();
   for (const bot of input.bots) {
     if (typeof bot.larkAppId !== 'string' || bot.larkAppId.trim() === '') throw new Error('bot config has no larkAppId');
+    configuredApps.add(bot.larkAppId.trim());
+  }
+  const mappings = validateUserOpenIdMappings(input.userOpenIdMappings, configuredApps);
+  const consumedMappings = new Set<string>();
+  for (const bot of input.bots) {
     const appId = bot.larkAppId.trim();
     const owner = input.ownerOpenIds.get(appId);
     if (!owner || !validOpenId(owner)) throw new Error(`missing explicit --owner ${appId}:ou_... mapping`);
     const users = [...(bot.allowedUsers ?? [])];
     for (const raw of users) {
-      const mapped = validOpenId(raw)
-        ? raw
-        : input.userOpenIdMappings?.get(`${appId}\0${raw}`);
+      if (typeof raw !== 'string') {
+        throw new Error(`allowedUsers for ${appId} contains an unresolved identity; provide an explicit --map ${appId}:<raw>=ou_...`);
+      }
+      const mappingKey = `${appId}${MAPPING_SEPARATOR}${raw}`;
+      const hasMapping = mappings.has(mappingKey);
+      if (hasMapping) consumedMappings.add(mappingKey);
+      // An explicit mapping wins even when the raw config value already looks
+      // like an open_id: copied ou_ values are syntactically valid but may be
+      // scoped to another Lark app.
+      const mapped = hasMapping ? mappings.get(mappingKey) : (validOpenId(raw) ? raw : undefined);
       if (!mapped || !validOpenId(mapped)) {
         throw new Error(`allowedUsers for ${appId} contains an unresolved identity; provide an explicit --map ${appId}:${raw}=ou_...`);
       }
@@ -56,15 +110,26 @@ export function buildPrincipalSeedRows(input: {
       rows.push({ key: { larkAppId: appId, openId: owner }, canOpenMemory: true, reason: 'explicit_owner' });
     }
   }
+  for (const key of mappings.keys()) {
+    if (!consumedMappings.has(key)) {
+      const split = key.indexOf(MAPPING_SEPARATOR);
+      throw new Error(`unused --map mapping for ${key.slice(0, split)}:${key.slice(split + 1)}`);
+    }
+  }
   for (const key of input.explicitOpenIds ?? []) {
-    if (typeof key.larkAppId !== 'string' || typeof key.openId !== 'string' || !validOpenId(key.openId)) {
+    if (typeof key?.larkAppId !== 'string' || typeof key.openId !== 'string' || !validOpenId(key.openId)) {
       throw new Error('explicit principal must be <larkAppId>:<app-scoped ou_...>');
     }
-    if (!configuredApps.has(key.larkAppId.trim())) throw new Error(`explicit principal app is absent from bots config: ${key.larkAppId}`);
-    const dedupe = `${key.larkAppId}\0${key.openId}`;
+    const appId = key.larkAppId.trim();
+    if (appId === '' || appId !== key.larkAppId) {
+      throw new Error('explicit principal must use the exact configured larkAppId');
+    }
+    if (!configuredApps.has(appId)) throw new Error(`explicit principal app is absent from bots config: ${appId}`);
+    const dedupe = `${appId}\0${key.openId}`;
     if (seen.has(dedupe)) continue;
     seen.add(dedupe);
-    rows.push({ key, canOpenMemory: input.ownerOpenIds.get(key.larkAppId) === key.openId, reason: input.ownerOpenIds.get(key.larkAppId) === key.openId ? 'explicit_owner' : 'allowed_user' });
+    const canOpenMemory = input.ownerOpenIds.get(appId) === key.openId;
+    rows.push({ key: { larkAppId: appId, openId: key.openId }, canOpenMemory, reason: canOpenMemory ? 'explicit_owner' : 'allowed_user' });
   }
   return rows;
 }
