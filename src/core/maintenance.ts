@@ -265,6 +265,11 @@ export function detachedRestartEnv(inheritedEnv: NodeJS.ProcessEnv = process.env
     'BOTMUX_DAEMON_IPC_BASE_PORT',
     'BOTMUX_DASHBOARD_PUBLIC_READONLY',
     'BOTMUX_PUBLIC_URL',
+    'BOTMUX_MEMORY_GATE_CAPABILITY_SECRET',
+    // The raw OpenMemory key is dashboard-only and must be reloaded from the
+    // persisted env snapshot during a detached restart, never inherited from
+    // a daemon/dashboard child.
+    'OM_API_KEY',
   ]) delete env[key];
   return env;
 }

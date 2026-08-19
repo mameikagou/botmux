@@ -9,6 +9,7 @@ import {
   type PodmanCommandResult,
   type PodmanCommandRunner,
 } from '../src/execution/podman-provider.js';
+import { createMemoryGateCapability } from '../src/services/openmemory-memory-gate.js';
 
 function git(command: string, args: readonly string[]): PodmanCommandResult {
   const result = spawnSync(command, [...args], {
@@ -136,7 +137,9 @@ describe('PodmanExecutionProvider', () => {
     const prepared = await provider.prepare({
       sessionId: 'session-api',
       cliId: 'opencode',
-      principalBinding: { larkAppId: 'cli_test', openId: 'ou_test', canOpenMemory: true },
+      // OpenCode has no frozen remote-MCP contract in this build. Treat this
+      // as a friend session and prove it cannot receive the owner forward.
+      principalBinding: { larkAppId: 'cli_test', openId: 'ou_test', canOpenMemory: false },
       credentialBinding: {
         credentialKind: 'api',
         credentialVersion: 2,
@@ -161,7 +164,8 @@ describe('PodmanExecutionProvider', () => {
    expect(argv).not.toContain('secret-do-not-log');
     expect(argv).toContain('--rm');
     expect(argv).toContain('--userns=keep-id');
-    expect(argv).toContain('--network=pasta:--no-map-gw,-T,18181');
+    expect(argv).toContain('--network=pasta:--no-map-gw');
+    expect(argv).not.toContain('18181');
     expect(argv).toContain('--add-host=host.containers.internal:127.0.0.1');
     expect(argv).toContain('--add-host=host.docker.internal:127.0.0.1');
     expect(argv).toContain('dst=/shared/quant-data,ro');
@@ -309,5 +313,223 @@ describe('PodmanExecutionProvider', () => {
     chmodSync(authPath, 0o600);
     const prepared = await provider.prepare(input);
     expect(prepared.runtime.codexAuthPath).toBe(authPath);
+  });
+
+  it('merges owner MCP config without replacing existing Codex providers', async () => {
+    const fixture = makeFixture();
+    const sessionId = 'owner-memory-codex';
+    const runtime = buildSessionRuntimePaths(fixture.config, { larkAppId: 'cli_test', openId: 'ou_owner' }, sessionId);
+    mkdirSync(dirname(runtime.codexAuthPath), { recursive: true, mode: 0o700 });
+    writeFileSync(runtime.codexAuthPath, JSON.stringify({ tokens: { access_token: 'fixture-token' } }), { mode: 0o600 });
+    mkdirSync(join(runtime.homeRoot, '.codex'), { recursive: true });
+    writeFileSync(join(runtime.homeRoot, '.codex', 'config.toml'), [
+      'model_provider = "existing"',
+      'model = "existing-model"',
+      '',
+      '[model_providers.existing]',
+      'name = "existing"',
+      'base_url = "https://existing.example/v1"',
+      '',
+      '[mcp_servers.other]',
+      'url = "https://other.example/mcp"',
+      '',
+    ].join('\n'));
+    const capability = createMemoryGateCapability({
+      secret: 'memory-gate-test-secret-0123456789abcdef',
+      sessionHash: runtime.sessionHash,
+      principalHash: runtime.principalHash,
+    });
+    const provider = new PodmanExecutionProvider(fixture.config, {
+      commandRunner: fakeRunner([]),
+      checkImage: false,
+      hostUid: 1000,
+      hostGid: 1000,
+    });
+    const prepared = await provider.prepare({
+      sessionId,
+      cliId: 'codex',
+      principalBinding: {
+        larkAppId: 'cli_test',
+        openId: 'ou_owner',
+        enabled: true,
+        canOpenMemory: true,
+      },
+      credentialBinding: {
+        kind: 'api',
+        version: 1,
+        baseUrl: 'https://api.example.com/v1',
+        model: 'codex-owner-test',
+      },
+      memoryGateCapability: capability,
+    });
+    const configText = readFileSync(join(runtime.homeRoot, '.codex', 'config.toml'), 'utf8');
+    expect(configText).toContain('[model_providers.existing]');
+    expect(configText).toContain('[mcp_servers.other]');
+    expect(configText).toContain('model_provider = "botmux_api"');
+    expect(configText).toContain('[model_providers.botmux_api]');
+    expect(configText).toContain('base_url = "https://api.example.com/v1"');
+    expect(configText).toContain('[mcp_servers.openmemory]');
+    expect(configText).toContain('bearer_token_env_var = "BOTMUX_MEMORY_CAPABILITY"');
+    expect(configText).not.toContain(capability);
+    const launch = provider.launch(prepared, {
+      cliId: 'codex',
+      bin: 'codex',
+      args: ['--version'],
+      credentialSecret: 'owner-api-secret',
+    });
+    expect(launch.args.join('\n')).not.toContain(capability);
+    expect(launch.env.BOTMUX_MEMORY_CAPABILITY).toBe(capability);
+  });
+
+  it('removes the owner MCP entry when a cold instance is revoked', async () => {
+    const fixture = makeFixture();
+    const sessionId = 'owner-memory-revoked';
+    const runtime = buildSessionRuntimePaths(fixture.config, { larkAppId: 'cli_test', openId: 'ou_owner' }, sessionId);
+    mkdirSync(dirname(runtime.codexAuthPath), { recursive: true, mode: 0o700 });
+    writeFileSync(runtime.codexAuthPath, JSON.stringify({ tokens: { access_token: 'fixture-token' } }), { mode: 0o600 });
+    mkdirSync(join(runtime.homeRoot, '.codex'), { recursive: true });
+    writeFileSync(join(runtime.homeRoot, '.codex', 'config.toml'), [
+      'model_provider = "existing"',
+      'model = "existing-model"',
+      '',
+      '[model_providers.existing]',
+      'name = "existing"',
+      'base_url = "https://existing.example/v1"',
+      '',
+    ].join('\n'));
+    const provider = new PodmanExecutionProvider(fixture.config, {
+      commandRunner: fakeRunner([]),
+      checkImage: false,
+      hostUid: 1000,
+      hostGid: 1000,
+    });
+    const capability = createMemoryGateCapability({
+      secret: 'memory-gate-test-secret-0123456789abcdef',
+      sessionHash: runtime.sessionHash,
+      principalHash: runtime.principalHash,
+    });
+    await provider.prepare({
+      sessionId,
+      cliId: 'codex',
+      principalBinding: { larkAppId: 'cli_test', openId: 'ou_owner', enabled: true, canOpenMemory: true },
+      credentialBinding: { kind: 'codex_chatgpt', version: 1 },
+      memoryGateCapability: capability,
+    });
+    const configPath = join(runtime.homeRoot, '.codex', 'config.toml');
+    expect(readFileSync(configPath, 'utf8')).toContain('[mcp_servers.openmemory]');
+    await provider.prepare({
+      sessionId,
+      cliId: 'codex',
+      principalBinding: { larkAppId: 'cli_test', openId: 'ou_owner', enabled: true, canOpenMemory: false },
+      credentialBinding: { kind: 'codex_chatgpt', version: 1 },
+    });
+    const revokedConfig = readFileSync(configPath, 'utf8');
+    expect(revokedConfig).not.toContain('openmemory');
+    expect(revokedConfig).not.toContain('18181');
+    expect(revokedConfig).not.toContain('BOTMUX_MEMORY_CAPABILITY');
+    expect(revokedConfig).toContain('model_provider = "existing"');
+    expect(revokedConfig).toContain('model = "existing-model"');
+    expect(revokedConfig).toContain('[model_providers.existing]');
+  });
+
+  it('merges Claude MCP JSON and expands only the capability env reference', async () => {
+    const fixture = makeFixture();
+    const sessionId = 'owner-memory-claude';
+    const runtime = buildSessionRuntimePaths(fixture.config, { larkAppId: 'cli_test', openId: 'ou_owner' }, sessionId);
+    mkdirSync(join(runtime.homeRoot, '.agent'), { recursive: true });
+    writeFileSync(join(runtime.homeRoot, '.claude.json'), JSON.stringify({
+      theme: 'existing',
+      mcpServers: { other: { type: 'http', url: 'https://other.example/mcp' } },
+    }, null, 2));
+    const capability = createMemoryGateCapability({
+      secret: 'memory-gate-test-secret-0123456789abcdef',
+      sessionHash: runtime.sessionHash,
+      principalHash: runtime.principalHash,
+    });
+    const provider = new PodmanExecutionProvider(fixture.config, {
+      commandRunner: fakeRunner([]),
+      checkImage: false,
+      hostUid: 1000,
+      hostGid: 1000,
+    });
+    const prepared = await provider.prepare({
+      sessionId,
+      cliId: 'claude-code',
+      principalBinding: { larkAppId: 'cli_test', openId: 'ou_owner', enabled: true, canOpenMemory: true },
+      credentialBinding: { kind: 'api', version: 1, baseUrl: 'https://api.example.com/v1', model: 'claude-owner-test' },
+      memoryGateCapability: capability,
+    });
+    const config = JSON.parse(readFileSync(join(runtime.homeRoot, '.claude.json'), 'utf8')) as {
+      theme: string;
+      mcpServers: Record<string, { url?: string; headers?: Record<string, string> }>;
+    };
+    expect(config.theme).toBe('existing');
+    expect(config.mcpServers.other.url).toBe('https://other.example/mcp');
+    expect(config.mcpServers.openmemory.url).toBe('http://127.0.0.1:18181/mcp');
+    expect(config.mcpServers.openmemory.headers?.Authorization)
+      .toBe('Bearer ${BOTMUX_MEMORY_CAPABILITY}');
+    expect(readFileSync(join(runtime.homeRoot, '.claude.json'), 'utf8')).not.toContain(capability);
+    const launch = provider.launch(prepared, {
+      cliId: 'claude-code',
+      bin: 'claude',
+      args: ['--version'],
+      credentialSecret: 'claude-owner-api-secret',
+    });
+    expect(launch.args.join('\n')).not.toContain(capability);
+    expect(launch.env.BOTMUX_MEMORY_CAPABILITY).toBe(capability);
+  });
+
+  it('fails closed on uncontrolled Codex/Claude openmemory name collisions and preserves them on revoke', async () => {
+    const fixture = makeFixture();
+    const secret = 'memory-gate-test-secret-0123456789abcdef';
+    const provider = new PodmanExecutionProvider(fixture.config, {
+      commandRunner: fakeRunner([]),
+      checkImage: false,
+      hostUid: 1000,
+      hostGid: 1000,
+    });
+
+    const codexSession = 'owner-memory-codex-collision';
+    const codexRuntime = buildSessionRuntimePaths(fixture.config, { larkAppId: 'cli_test', openId: 'ou_collision_codex' }, codexSession);
+    mkdirSync(join(codexRuntime.homeRoot, '.codex'), { recursive: true });
+    const codexCollision = '[mcp_servers.openmemory]\ncommand = "user-owned-openmemory"\n';
+    writeFileSync(join(codexRuntime.homeRoot, '.codex', 'config.toml'), codexCollision);
+    const codexCapability = createMemoryGateCapability({ secret, sessionHash: codexRuntime.sessionHash, principalHash: codexRuntime.principalHash });
+    await expect(provider.prepare({
+      sessionId: codexSession,
+      cliId: 'codex',
+      principalBinding: { larkAppId: 'cli_test', openId: 'ou_collision_codex', enabled: true, canOpenMemory: true },
+      credentialBinding: { kind: 'api', version: 1, baseUrl: 'https://api.example.com/v1', model: 'collision-codex' },
+      memoryGateCapability: codexCapability,
+    })).rejects.toThrow(/uncontrolled name collision/);
+    await provider.prepare({
+      sessionId: codexSession,
+      cliId: 'codex',
+      principalBinding: { larkAppId: 'cli_test', openId: 'ou_collision_codex', enabled: true, canOpenMemory: false },
+      credentialBinding: { kind: 'api', version: 1, baseUrl: 'https://api.example.com/v1', model: 'collision-codex' },
+    });
+    expect(readFileSync(join(codexRuntime.homeRoot, '.codex', 'config.toml'), 'utf8')).toContain('command = "user-owned-openmemory"');
+
+    const claudeSession = 'owner-memory-claude-collision';
+    const claudeRuntime = buildSessionRuntimePaths(fixture.config, { larkAppId: 'cli_test', openId: 'ou_collision_claude' }, claudeSession);
+    mkdirSync(claudeRuntime.homeRoot, { recursive: true });
+    const claudeCollision = { mcpServers: { openmemory: { command: 'user-owned-openmemory' } } };
+    writeFileSync(join(claudeRuntime.homeRoot, '.claude.json'), `${JSON.stringify(claudeCollision)}\n`);
+    const claudeCapability = createMemoryGateCapability({ secret, sessionHash: claudeRuntime.sessionHash, principalHash: claudeRuntime.principalHash });
+    await expect(provider.prepare({
+      sessionId: claudeSession,
+      cliId: 'claude-code',
+      principalBinding: { larkAppId: 'cli_test', openId: 'ou_collision_claude', enabled: true, canOpenMemory: true },
+      credentialBinding: { kind: 'api', version: 1, baseUrl: 'https://api.example.com/v1', model: 'collision-claude' },
+      memoryGateCapability: claudeCapability,
+    })).rejects.toThrow(/uncontrolled name collision/);
+    await provider.prepare({
+      sessionId: claudeSession,
+      cliId: 'claude-code',
+      principalBinding: { larkAppId: 'cli_test', openId: 'ou_collision_claude', enabled: true, canOpenMemory: false },
+      credentialBinding: { kind: 'api', version: 1, baseUrl: 'https://api.example.com/v1', model: 'collision-claude' },
+    });
+    const preservedClaude = JSON.parse(readFileSync(join(claudeRuntime.homeRoot, '.claude.json'), 'utf8')) as { mcpServers: { openmemory: { command: string } } };
+    expect(preservedClaude.mcpServers.openmemory.command).toBe('user-owned-openmemory');
   });
 });

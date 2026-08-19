@@ -39,6 +39,12 @@ import {
   type PodmanMountPlan,
   type SessionRuntimePaths,
 } from './podman-execution.js';
+import {
+  MEMORY_GATE_CAPABILITY_ENV,
+  MEMORY_GATE_URL,
+  buildOwnerMemoryGatePlanFromCapability,
+  type MemoryGateSessionPlan,
+} from '../services/openmemory-memory-gate.js';
 
 const CONTAINER_HOME = '/home/dev';
 const CONTAINER_WORKSPACE = '/workspace';
@@ -100,6 +106,8 @@ export interface PodmanPrepareInput {
   readonly expectedOwnerOpenId?: string;
   readonly principalBinding?: PrincipalBinding;
   readonly credentialBinding?: CredentialBinding;
+  /** Transient owner-only capability; never persisted in Session. */
+  readonly memoryGateCapability?: string;
 }
 
 export interface PodmanCliLaunchSpec {
@@ -128,6 +136,7 @@ export interface PreparedExecution {
   readonly runtime: SessionRuntimePaths;
   readonly cliId: PodmanCliId;
   readonly credential: CredentialInjectionPlan;
+  readonly memoryGate?: MemoryGateSessionPlan;
   readonly mounts: readonly PodmanMountPlan[];
   readonly network: ReturnType<typeof buildPastaNetworkPlan>;
   readonly hostWorkingDir: string;
@@ -482,6 +491,17 @@ function assertPrepared(prepared: PreparedExecution, expectedConfig?: PodmanExec
   if (JSON.stringify(expectedMounts) !== JSON.stringify(prepared.mounts)) fail('prepared mounts do not match the T4 allow-list');
   const expectedNetwork = buildPastaNetworkPlan(prepared.network.canOpenMemory);
   if (JSON.stringify(expectedNetwork) !== JSON.stringify(prepared.network)) fail('prepared network does not match the T4 allow-list');
+  if (prepared.network.canOpenMemory) {
+    if (!prepared.memoryGate
+      || prepared.memoryGate.mcp.url !== MEMORY_GATE_URL
+      || prepared.memoryGate.mcp.capabilityEnvVar !== MEMORY_GATE_CAPABILITY_ENV
+      || prepared.memoryGate.mcp.capability !== prepared.memoryGate.capability
+      || (prepared.cliId !== 'codex' && prepared.cliId !== 'claude-code')) {
+      fail('owner OpenMemory execution is missing a valid MCP capability plan');
+    }
+  } else if (prepared.memoryGate) {
+    fail('friend execution must not carry an OpenMemory capability plan');
+  }
   const expectedTranscriptPaths: TranscriptPathMap = {
     hostSessionHome: prepared.runtime.homeRoot,
     containerSessionHome: CONTAINER_SESSION_HOME,
@@ -605,6 +625,12 @@ export class PodmanExecutionProvider {
       && input.principalBinding.credentialVersion !== credentialBinding.version) {
       fail('principal and credential bindings disagree on credential version');
     }
+    // A memory-capable launch is an owner-only exception.  T6 accepts an
+    // omitted `enabled` field for legacy friend bindings, but that omission
+    // must never accidentally produce the owner network forward.
+    if (principal.canOpenMemory && input.principalBinding?.enabled !== true) {
+      fail('owner OpenMemory execution requires an explicitly enabled principal');
+    }
     const runtime = buildSessionRuntimePaths(this.config, principal, sessionId);
     const lockKey = `${this.config.runtimeRoot}/${runtime.principalHash}/${runtime.sessionHash}`;
     const previous = prepareLocks.get(lockKey) ?? Promise.resolve(undefined as unknown as PreparedExecution);
@@ -620,6 +646,24 @@ export class PodmanExecutionProvider {
       });
       const mounts = buildPodmanMountPlan(this.config, runtime, credential);
       const network = buildPastaNetworkPlan(principal.canOpenMemory);
+      const memoryGate = principal.canOpenMemory
+        ? buildOwnerMemoryGatePlanFromCapability({
+            principal: {
+              enabled: input.principalBinding?.enabled,
+              canOpenMemory: principal.canOpenMemory,
+            },
+            cliId,
+            sessionHash: runtime.sessionHash,
+            principalHash: runtime.principalHash,
+            capability: input.memoryGateCapability ?? '',
+          })
+        : undefined;
+      if (principal.canOpenMemory && !memoryGate) {
+        fail('owner OpenMemory capability is required');
+      }
+      if (!principal.canOpenMemory && input.memoryGateCapability !== undefined) {
+        fail('friend execution must not receive an OpenMemory capability');
+      }
       requireSourceDirectory(this.config.sourceRepo, 'sourceRepo');
       requireSourceDirectory(this.config.dataRoot, 'dataRoot');
       // Podman must find the nested target before the parent read-only bind is
@@ -654,12 +698,21 @@ export class PodmanExecutionProvider {
       if (credential.providerConfig) {
         ensureProviderConfig(credential.providerConfig.path, credential.providerConfig);
       }
+      if (memoryGate) {
+        ensureMemoryMcpConfig(runtime.homeRoot, cliId, memoryGate);
+      } else {
+        // A session may be rehydrated after its DB row was revoked. Remove the
+        // integration-owned entry from the persistent CLI config so the new
+        // friend instance cannot retain a stale owner URL/token.
+        removeMemoryMcpConfig(runtime.homeRoot, cliId, credential.providerConfig === undefined);
+      }
       const prepared: PreparedExecution = {
         config: this.config,
         sessionId,
         runtime,
         cliId,
         credential,
+        ...(memoryGate ? { memoryGate } : {}),
         mounts,
         network,
         hostWorkingDir,
@@ -867,6 +920,11 @@ export class PodmanExecutionProvider {
       containerEnv.CODEX_HOME = join(CONTAINER_HOME, '.codex');
       containerEnv.CODEX_AUTH_FILE = join(CONTAINER_HOME, '.codex', 'auth.json');
     }
+    if (prepared.memoryGate) {
+      // The capability is injected as an env-only value. Podman argv carries
+      // only `--env=BOTMUX_MEMORY_CAPABILITY`, never the token itself.
+      containerEnv[MEMORY_GATE_CAPABILITY_ENV] = prepared.memoryGate.capability;
+    }
     const processEnv: Record<string, string> = { ...this.hostEnv };
     const secretKeys = new Set<string>();
     if (prepared.credential.credentialKind === 'api') {
@@ -874,6 +932,10 @@ export class PodmanExecutionProvider {
       if (prepared.credential.secretEnvVar) secretKeys.add(prepared.credential.secretEnvVar);
       processEnv.AGENT_API_KEY = launch.credentialSecret!;
       if (prepared.credential.secretEnvVar) processEnv[prepared.credential.secretEnvVar] = launch.credentialSecret!;
+    }
+    if (prepared.memoryGate) {
+      secretKeys.add(MEMORY_GATE_CAPABILITY_ENV);
+      processEnv[MEMORY_GATE_CAPABILITY_ENV] = prepared.memoryGate.capability;
     }
     const args: string[] = [
       'run',
@@ -994,32 +1056,269 @@ export class PodmanExecutionProvider {
 function ensureProviderConfig(path: string, plan: NonNullable<CredentialInjectionPlan['providerConfig']>): void {
   const parsed = resolve(path);
   ensureDirectory(dirname(parsed));
-  const body = plan.format === 'codex-toml'
-    ? [
-        'model_provider = "botmux_api"',
-        `model = ${JSON.stringify(plan.model)}`,
-        '',
-        '[model_providers.botmux_api]',
-        'name = "botmux_api"',
-        `base_url = ${JSON.stringify(plan.baseUrl)}`,
-        `env_key = ${JSON.stringify(plan.secretEnvVar)}`,
-        'wire_api = "responses"',
-        '',
-      ].join('\n')
-    : JSON.stringify({
-        cliId: plan.cliId,
-        credentialKind: plan.credentialKind,
-        baseUrl: plan.baseUrl,
-        model: plan.model,
-      }, (_key, value) => value === undefined ? undefined : value) + '\n';
-  // The provider config is a non-secret hint. Refuse a symlink and overwrite
-  // only this provider-owned leaf, never an arbitrary file from a binding.
+  // The provider config is a non-secret hint. Refuse a symlink and update only
+  // the provider-owned entry; arbitrary user/provider sections remain intact.
   if (existsSync(parsed)) {
     const stat = lstatSync(parsed);
     if (!stat.isFile() || stat.isSymbolicLink()) fail(`provider config is not a regular file: ${parsed}`);
   }
+  const previous = existsSync(parsed) ? readFileSync(parsed, 'utf8') : '';
+  const body = plan.format === 'codex-toml'
+    ? mergeCodexConfig(previous, plan, undefined)
+    : mergeProviderJson(previous, plan);
   writeFileSync(parsed, body, { mode: 0o600 });
   chmodSync(parsed, 0o600);
+}
+
+function controlledTomlSection(header: string, removeProvider: boolean, removeMemory: boolean): boolean {
+  if (removeProvider && /^(?:\[model_providers\.botmux_api\]|\[\[model_providers\.botmux_api\]\])$/u.test(header)) return true;
+  if (removeMemory && /^(?:\[mcp_servers\.openmemory\]|\[\[mcp_servers\.openmemory\]\])$/u.test(header)) return true;
+  return false;
+}
+
+const MANAGED_MEMORY_AUTHORIZATION = `Bearer \${${MEMORY_GATE_CAPABILITY_ENV}}`;
+
+/**
+ * The integration may only replace/remove the exact shape it wrote. A user
+ * entry called `openmemory` is otherwise an uncontrolled collision and is
+ * preserved (or causes an owner prepare to fail closed).
+ */
+function codexMemorySectionState(input: string): 'absent' | 'managed' | 'uncontrolled' {
+  const lines = input.split(/\r?\n/u);
+  let start = -1;
+  let arrayHeader = false;
+  for (let i = 0; i < lines.length; i += 1) {
+    const header = lines[i].trim();
+    if (header === '[[mcp_servers.openmemory]]') {
+      if (start >= 0) return 'uncontrolled';
+      start = i;
+      arrayHeader = true;
+      continue;
+    }
+    if (header === '[mcp_servers.openmemory]') {
+      if (start >= 0) return 'uncontrolled';
+      start = i;
+      continue;
+    }
+  }
+  if (start < 0) return 'absent';
+  if (arrayHeader) return 'uncontrolled';
+  const assignments: Record<string, string> = {};
+  for (let i = start + 1; i < lines.length; i += 1) {
+    const trimmed = lines[i].trim();
+    if (trimmed.startsWith('[')) break;
+    if (!trimmed) continue;
+    const match = /^(url|bearer_token_env_var)\s*=\s*"([^"\\]*)"$/u.exec(trimmed);
+    if (!match || assignments[match[1]] !== undefined) return 'uncontrolled';
+    assignments[match[1]] = match[2];
+  }
+  return Object.keys(assignments).length === 2
+    && assignments.url === MEMORY_GATE_URL
+    && assignments.bearer_token_env_var === MEMORY_GATE_CAPABILITY_ENV
+    ? 'managed'
+    : 'uncontrolled';
+}
+
+function topLevelTomlModelProvider(input: string): string | undefined {
+  for (const line of input.split(/\r?\n/u)) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('[')) break;
+    const match = /^model_provider\s*=\s*["']([^"']+)["']\s*$/u.exec(trimmed);
+    if (match) return match[1];
+  }
+  return undefined;
+}
+
+/** Remove only the sections owned by this integration before appending them. */
+function removeControlledTomlSections(
+  input: string,
+  options: { readonly removeProvider: boolean; readonly removeMemory: boolean; readonly removeProviderTopLevel: boolean },
+): string {
+  const kept: string[] = [];
+  let skip = false;
+  let beforeFirstSection = true;
+  for (const line of input.split(/\r?\n/u)) {
+    const header = line.trim();
+    if (header.startsWith('[') && header.endsWith(']')) {
+      skip = controlledTomlSection(header, options.removeProvider, options.removeMemory);
+      beforeFirstSection = false;
+    }
+    if (skip) continue;
+    if (options.removeProviderTopLevel && beforeFirstSection && /^(?:model_provider|model)\s*=/u.test(line.trim())) continue;
+    kept.push(line);
+  }
+  return kept.join('\n').replace(/\n{3,}$/u, '\n\n').trimEnd();
+}
+
+function mergeCodexConfig(
+  previous: string,
+  plan: NonNullable<CredentialInjectionPlan['providerConfig']> | undefined,
+  memoryGate: MemoryGateSessionPlan | undefined,
+): string {
+  if (memoryGate && codexMemorySectionState(previous) === 'uncontrolled') {
+    fail('Codex openmemory MCP entry is an uncontrolled name collision');
+  }
+  const body = removeControlledTomlSections(previous, {
+    removeProvider: plan !== undefined,
+    removeMemory: memoryGate !== undefined && codexMemorySectionState(previous) === 'managed',
+    removeProviderTopLevel: plan !== undefined,
+  });
+  const blocks: string[] = [];
+  if (plan) {
+    blocks.push([
+      'model_provider = "botmux_api"',
+      `model = ${JSON.stringify(plan.model)}`,
+      '',
+      '[model_providers.botmux_api]',
+      'name = "botmux_api"',
+      `base_url = ${JSON.stringify(plan.baseUrl)}`,
+      `env_key = ${JSON.stringify(plan.secretEnvVar)}`,
+      'wire_api = "responses"',
+    ].join('\n'));
+  }
+  if (memoryGate) {
+    blocks.push([
+      '[mcp_servers.openmemory]',
+      `url = ${JSON.stringify(memoryGate.mcp.url)}`,
+      `bearer_token_env_var = ${JSON.stringify(MEMORY_GATE_CAPABILITY_ENV)}`,
+    ].join('\n'));
+  }
+  return `${body}${body && blocks.length ? '\n\n' : ''}${blocks.join('\n\n')}${blocks.length ? '\n' : ''}`;
+}
+
+function mergeProviderJson(previous: string, plan: NonNullable<CredentialInjectionPlan['providerConfig']>): string {
+  let data: Record<string, unknown> = {};
+  if (previous.trim()) {
+    try {
+      const parsed: unknown = JSON.parse(previous);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) fail('provider config JSON must be an object');
+      data = parsed as Record<string, unknown>;
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith('[podman]')) throw error;
+      fail('provider config JSON is invalid');
+    }
+  }
+  return `${JSON.stringify({
+    ...data,
+    cliId: plan.cliId,
+    credentialKind: plan.credentialKind,
+    baseUrl: plan.baseUrl,
+    model: plan.model,
+  }, null, 2)}\n`;
+}
+
+function ensureMemoryMcpConfig(
+  sessionHome: string,
+  cliId: PodmanCliId,
+  memoryGate: MemoryGateSessionPlan,
+): void {
+  if (cliId === 'codex') {
+    const path = join(sessionHome, '.codex', 'config.toml');
+    ensureDirectory(dirname(path));
+    const stat = existsSync(path) ? lstatSync(path) : undefined;
+    if (stat && (!stat.isFile() || stat.isSymbolicLink())) fail(`MCP config is not a regular file: ${path}`);
+    const previous = existsSync(path) ? readFileSync(path, 'utf8') : '';
+    if (codexMemorySectionState(previous) === 'uncontrolled') {
+      fail('Codex openmemory MCP entry is an uncontrolled name collision');
+    }
+    writeFileSync(path, mergeCodexConfig(previous, undefined, memoryGate), { mode: 0o600 });
+    chmodSync(path, 0o600);
+    return;
+  }
+  if (cliId !== 'claude-code') fail('owner OpenMemory MCP is unsupported by this harness');
+  const path = join(sessionHome, '.claude.json');
+  ensureDirectory(dirname(path));
+  const stat = existsSync(path) ? lstatSync(path) : undefined;
+  if (stat && (!stat.isFile() || stat.isSymbolicLink())) fail(`MCP config is not a regular file: ${path}`);
+  let data: Record<string, unknown> = {};
+  if (existsSync(path)) {
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) fail('Claude MCP config must be an object');
+      data = parsed as Record<string, unknown>;
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith('[podman]')) throw error;
+      fail('Claude MCP config is invalid');
+    }
+  }
+  const currentServers = data.mcpServers;
+  if (currentServers !== undefined && (!currentServers || typeof currentServers !== 'object' || Array.isArray(currentServers))) {
+    fail('Claude MCP config mcpServers must be an object');
+  }
+  const mcpServers = (currentServers ?? {}) as Record<string, unknown>;
+  const existingOpenmemory = mcpServers.openmemory;
+  if (existingOpenmemory !== undefined && !isManagedClaudeMemoryEntry(existingOpenmemory)) {
+    fail('Claude openmemory MCP entry is an uncontrolled name collision');
+  }
+  data.mcpServers = {
+    ...mcpServers,
+    openmemory: {
+      type: 'http',
+      url: memoryGate.mcp.url,
+      headers: { Authorization: `Bearer \${${MEMORY_GATE_CAPABILITY_ENV}}` },
+    },
+  };
+  writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
+  chmodSync(path, 0o600);
+}
+
+function isManagedClaudeMemoryEntry(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const entry = value as Record<string, unknown>;
+  if (Object.keys(entry).sort().join('\u0000') !== 'headers\u0000type\u0000url') return false;
+  if (entry.type !== 'http' || entry.url !== MEMORY_GATE_URL) return false;
+  if (!entry.headers || typeof entry.headers !== 'object' || Array.isArray(entry.headers)) return false;
+  const headers = entry.headers as Record<string, unknown>;
+  return Object.keys(headers).length === 1 && headers.Authorization === MANAGED_MEMORY_AUTHORIZATION;
+}
+
+/** Remove only entries previously owned by the MemoryGate integration. */
+function removeMemoryMcpConfig(sessionHome: string, cliId: PodmanCliId, removeProvider: boolean): void {
+  if (cliId === 'codex') {
+    const path = join(sessionHome, '.codex', 'config.toml');
+    if (!existsSync(path)) return;
+    const stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink()) fail(`MCP config is not a regular file: ${path}`);
+    const previous = readFileSync(path, 'utf8');
+    const selectsBotmuxProvider = removeProvider && topLevelTomlModelProvider(previous) === 'botmux_api';
+    const memoryState = codexMemorySectionState(previous);
+    let body = removeControlledTomlSections(previous, {
+      removeProvider,
+      removeMemory: memoryState === 'managed',
+      removeProviderTopLevel: selectsBotmuxProvider,
+    });
+    if (body !== previous) {
+      writeFileSync(path, body, { mode: 0o600 });
+      chmodSync(path, 0o600);
+    }
+    return;
+  }
+  if (cliId !== 'claude-code') return;
+  const path = join(sessionHome, '.claude.json');
+  if (!existsSync(path)) return;
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.isSymbolicLink()) fail(`MCP config is not a regular file: ${path}`);
+  let data: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) fail('Claude MCP config must be an object');
+    data = parsed as Record<string, unknown>;
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('[podman]')) throw error;
+    fail('Claude MCP config is invalid');
+  }
+  const currentServers = data.mcpServers;
+  if (currentServers === undefined) return;
+  if (!currentServers || typeof currentServers !== 'object' || Array.isArray(currentServers)) {
+    fail('Claude MCP config mcpServers must be an object');
+  }
+  const servers = currentServers as Record<string, unknown>;
+  if (!Object.prototype.hasOwnProperty.call(servers, 'openmemory')) return;
+  if (!isManagedClaudeMemoryEntry(servers.openmemory)) return;
+  const { openmemory: _removed, ...withoutMemory } = servers;
+  data.mcpServers = withoutMemory;
+  writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
+  chmodSync(path, 0o600);
 }
 
 export const createPodmanExecutionProvider = (

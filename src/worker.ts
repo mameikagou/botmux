@@ -11505,6 +11505,7 @@ async function spawnCli(
       expectedOwnerOpenId: cfg.ownerOpenId,
       principalBinding: cfg.principalBinding,
       credentialBinding: cfg.credentialBinding,
+      memoryGateCapability: cfg.memoryGateCapability,
     });
     // Construct lazily on the first T3 request so a worker can still boot
     // without a research DB configured; the relay itself remains fail-closed

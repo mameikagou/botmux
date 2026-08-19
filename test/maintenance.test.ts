@@ -206,6 +206,8 @@ describe('detachedRestartEnv', () => {
       // else a detached restart keeps the stale proxy base instead of reloading
       // it from ~/.botmux/.env.
       BOTMUX_PUBLIC_URL: 'http://stale.proxy.example.com',
+      BOTMUX_MEMORY_GATE_CAPABILITY_SECRET: 'stale-capability-secret',
+      OM_API_KEY: 'stale-raw-openmemory-key',
       ...Object.fromEntries(WORKFLOW_WORKER_ENV_KEYS.map((key) => [key, 'leaked'])),
       PATH: '/usr/bin',
     };
@@ -213,6 +215,7 @@ describe('detachedRestartEnv', () => {
     expect(detachedRestartEnv(inherited)).toEqual({ PATH: '/usr/bin' });
     expect(inherited.WEB_EXTERNAL_HOST).toBe('10.255.64.131');
     expect(inherited.BOTMUX_WORKFLOW).toBe('leaked');
+    expect(inherited.OM_API_KEY).toBe('stale-raw-openmemory-key');
   });
 });
 

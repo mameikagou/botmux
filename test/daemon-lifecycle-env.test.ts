@@ -12,6 +12,7 @@ describe('resolveDaemonEnv()', () => {
       BOTMUX_DAEMON_IPC_BASE_PORT: '9998',
       BOTMUX_DASHBOARD_PUBLIC_READONLY: 'false',
       BOTMUX_PUBLIC_URL: 'http://stale.proxy.example.com',
+      OM_API_KEY: 'raw-key-must-not-enter-daemon-env',
     })).toEqual({
       WEB_EXTERNAL_HOST: '',
       BOTMUX_DASHBOARD_EXTERNAL_HOST: '',
@@ -21,6 +22,7 @@ describe('resolveDaemonEnv()', () => {
       BOTMUX_DASHBOARD_PUBLIC_READONLY: '',
       BOTMUX_PUBLIC_URL: '',
     });
+    expect(resolveDaemonEnv({ OM_API_KEY: 'raw-key-must-not-enter-daemon-env' })).not.toHaveProperty('OM_API_KEY');
   });
 
   it('reloads explicit settings from .env for a session-origin restart', () => {

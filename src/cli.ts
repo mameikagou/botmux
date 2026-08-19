@@ -828,6 +828,12 @@ function ecosystemConfig(
       out_file: join(LOG_DIR, `daemon-${i}-out.log`),
       env: {
         ...daemonEnv,
+        // PM2 otherwise inherits the CLI's environment. Explicitly blank the
+        // OpenMemory authorities in every bot daemon; daemons read only the
+        // permission-checked signer file when minting and never receive raw
+        // OM_API_KEY through PM2.
+        OM_API_KEY: '',
+        BOTMUX_MEMORY_GATE_CAPABILITY_SECRET: '',
         ...managedExit.env,
         SESSION_DATA_DIR: DATA_DIR,
         BOTMUX_BOT_INDEX: String(i),
@@ -863,6 +869,11 @@ function ecosystemConfig(
     merge_logs: true,
     env: {
       ...daemonEnv,
+      // The dashboard is the sole stable MemoryGate host process. It loads
+      // both authorities from its private ~/.botmux/.env at runtime; do not
+      // bake either secret into this generated PM2 ecosystem file.
+      OM_API_KEY: '',
+      BOTMUX_MEMORY_GATE_CAPABILITY_SECRET: '',
       ...managedExit.env,
       // MUST match the bot daemons' SESSION_DATA_DIR: the dashboard shares
       // pairings/federations/memberships with them via {dataDir}/*.json. Without

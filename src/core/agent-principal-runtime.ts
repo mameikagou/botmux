@@ -7,6 +7,13 @@ import { buildSessionRuntimePaths } from '../execution/podman-execution.js';
 import type { PodmanExecutionConfig } from '../execution/podman-execution.js';
 import { writeCodexAuthJson } from '../services/codex-device-login.js';
 import { lstatSync, readFileSync } from 'node:fs';
+import {
+  buildOwnerMemoryGatePlan,
+  loadMemoryGateCapabilitySecretFromConfig,
+  probeMemoryGateReadiness,
+  supportsOwnerMemoryMcp,
+} from '../services/openmemory-memory-gate.js';
+import { principalHash, sessionHash } from '../execution/podman-execution.js';
 
 let repository: AgentPrincipalRepository | undefined;
 
@@ -81,6 +88,33 @@ export function assertPodmanPrincipalReadyForFork(input: {
   }
 }
 
+async function prepareOwnerMemoryCapability(ds: DaemonSession, cliId: string): Promise<void> {
+  const binding = ds.session.principalBinding;
+  ds.memoryGateCapability = undefined;
+  if (!binding || binding.enabled !== true || binding.canOpenMemory !== true) return;
+  if (!supportsOwnerMemoryMcp(cliId)) {
+    throw new Error('owner OpenMemory MCP is unsupported by this harness');
+  }
+  const openId = binding.openId ?? binding.open_id;
+  if (!openId || binding.larkAppId !== ds.larkAppId) {
+    throw new Error('owner OpenMemory principal identity is invalid');
+  }
+  const secret = loadMemoryGateCapabilitySecretFromConfig();
+  if (!secret) throw new Error('owner OpenMemory capability secret is not configured');
+  if (!(await probeMemoryGateReadiness({ secret }))) {
+    throw new Error('owner OpenMemory gate is not ready');
+  }
+  const plan = buildOwnerMemoryGatePlan({
+    principal: binding,
+    cliId,
+    sessionHash: sessionHash(ds.larkAppId, openId, ds.session.sessionId),
+    principalHash: principalHash(ds.larkAppId, openId),
+    capabilitySecret: secret,
+  });
+  if (!plan) throw new Error('owner OpenMemory capability could not be prepared');
+  ds.memoryGateCapability = plan.capability;
+}
+
 /**
  * Resolve once for a new Podman topic, or rehydrate only a cold worker. The
  * returned secret lives only on DaemonSession until worker init; Session gets
@@ -126,6 +160,13 @@ export async function ensureSandboxPrincipalForFork(input: {
         ds.credentialSecret = undefined;
       }
     }
+    try {
+      await prepareOwnerMemoryCapability(ds, cliId);
+    } catch (error) {
+      ds.credentialSecret = undefined;
+      ds.memoryGateCapability = undefined;
+      throw error;
+    }
     return;
   }
   const resolved = await bindNewPodmanSession({
@@ -144,6 +185,13 @@ export async function ensureSandboxPrincipalForFork(input: {
     ds.credentialSecret = resolved.credentialBinding.kind === 'api'
       ? resolved.credentialSecret
       : undefined;
+    try {
+      await prepareOwnerMemoryCapability(ds, cliId);
+    } catch (error) {
+      ds.credentialSecret = undefined;
+      ds.memoryGateCapability = undefined;
+      throw error;
+    }
   }
 }
 

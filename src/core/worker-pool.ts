@@ -393,7 +393,14 @@ const TRANSFER_FORCE_EXIT_MS = 500;
 // pm2-graceful-exit.ts): a worker (or the CLI child it forks — redactChildEnv
 // strips it there too) that inherited it would exit 90 instead of 0 on a
 // clean foreground stop, which a supervisor reads as a crash.
-const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN', 'BOTMUX_PM2_GRACEFUL_EXIT_CODE'] as const;
+const WORKER_REDACTED_ENV_KEYS = [
+  'GITHUB_TOKEN',
+  'GH_TOKEN',
+  'BOTMUX_PM2_GRACEFUL_EXIT_CODE',
+  // OpenMemory credentials are daemon-gate material, never worker/CLI env.
+  'OM_API_KEY',
+  'BOTMUX_MEMORY_GATE_CAPABILITY_SECRET',
+] as const;
 
 function workerForkEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
@@ -6906,6 +6913,7 @@ export function forkWorker(
     ...(ds.session.principalBinding ? { principalBinding: ds.session.principalBinding } : {}),
     ...(ds.session.credentialBinding ? { credentialBinding: ds.session.credentialBinding } : {}),
     ...(podmanExecution && ds.credentialSecret ? { credentialSecret: ds.credentialSecret } : {}),
+    ...(podmanExecution && ds.memoryGateCapability ? { memoryGateCapability: ds.memoryGateCapability } : {}),
     riffParentTaskId: ds.session.riffParentTaskId,
     riffRepoDirs: ds.session.riffRepoDirs,
     deferredScheduleRun: ds.session.deferredScheduleRun,
@@ -6989,7 +6997,11 @@ export function forkWorker(
   // Keep the durable in-memory launch snapshot free of the transient secret;
   // the raw init message is sent over IPC below and may remain only in the
   // short-lived receipt retry record until the worker acknowledges it.
-  const { credentialSecret: _transientCredentialSecret, ...withoutTransientCredential } = initMsg;
+  const {
+    credentialSecret: _transientCredentialSecret,
+    memoryGateCapability: _transientMemoryGateCapability,
+    ...withoutTransientCredential
+  } = initMsg;
   durableInitMsg = withoutTransientCredential;
   ds.initConfig = durableInitMsg;
 
@@ -7029,6 +7041,7 @@ export function forkWorker(
   // must not remain on the long-lived DaemonSession after IPC dispatch; a cold
   // replacement will explicitly rehydrate a fresh version from PostgreSQL.
   if (initDispatched) ds.credentialSecret = undefined;
+  if (initDispatched) ds.memoryGateCapability = undefined;
   ds.spawnedAt = Date.now();
   // master: per-runtime-key CLI version (the init send already happened above via
   // the tracked-delivery if/else — do NOT re-send initMsg here).
@@ -7046,6 +7059,7 @@ export function forkWorker(
     // the decrypted secret before restoring the durable session state; a
     // later retry must rehydrate it under the current credential version.
     ds.credentialSecret = undefined;
+    ds.memoryGateCapability = undefined;
     if (ds.worker === spawnedWorker) {
       ds.worker = null;
       ds.workerPort = null;

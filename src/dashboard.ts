@@ -217,6 +217,7 @@ import {
   handleDesktopCompat,
 } from './dashboard/compat.js';
 import { isDashboardChunkJsPath, missingDashboardChunkModule } from './dashboard/stale-chunk-module.js';
+import { ensureMemoryGateFromEnv, loadMemoryGateRuntimeEnv, stopMemoryGateSync } from './services/openmemory-memory-gate.js';
 import { aggregateRoleBatch, parseRoleBatchTargets } from './dashboard/roles-batch.js';
 import { automateOpenPlatformSetup, vcListenerEventGateError } from './setup/open-platform-automation.js';
 import { VC_MEETING_FEATURE_SCOPES, VC_MEETING_REALTIME_VOICE_SCOPES } from './setup/verify-permissions.js';
@@ -6136,10 +6137,23 @@ server.on('upgrade', (req: IncomingMessage, clientSocket: Duplex, head: Buffer) 
 server.keepAliveTimeout = 75_000;
 server.headersTimeout = 80_000;
 
-// Probe upward on EADDRINUSE rather than crashing with an unhandled 'error':
-// a second botmux instance on this host (or a stray process) holding the
-// configured port would otherwise tear the dashboard process down on bind.
-// The bound port is persisted so `botmux dashboard` can still reach us.
+// The dashboard is the sole MemoryGate owner. A failed fixed-port bind is
+// reported below and leaves owner sessions fail-closed; no sibling daemon is
+// adopted as a replacement listener.
+const gateRuntimeEnv = loadMemoryGateRuntimeEnv();
+let dashboardShuttingDown = false;
+void ensureMemoryGateFromEnv(gateRuntimeEnv).then(gate => {
+  if (dashboardShuttingDown) {
+    gate?.stopSync();
+    return;
+  }
+  if (gate) logger.info('[memory-gate] owner bridge listening on 127.0.0.1:18181');
+  else if (!gateRuntimeEnv.OM_API_KEY || !gateRuntimeEnv.BOTMUX_MEMORY_GATE_CAPABILITY_SECRET) {
+    logger.info('[memory-gate] owner bridge disabled: dashboard-only host secret(s) are not configured');
+  }
+}).catch(error => {
+  logger.warn(`[memory-gate] owner bridge unavailable; owner sessions fail closed: ${error instanceof Error ? error.message : 'startup failure'}`);
+});
 listenWithProbe({
   server,
   port: config.dashboard.port,
@@ -6394,6 +6408,7 @@ async function maybeAnnounceHallPresence(): Promise<void> {
 
 // Graceful shutdown
 function shutdown(): void {
+  dashboardShuttingDown = true;
   codexNotifierAbort.abort();
   for (const off of subs.values()) off();
   subs.clear();
@@ -6402,6 +6417,9 @@ function shutdown(): void {
   platformTunnel?.stop();
   debugTerminalManager.shutdown();
   feedbackAnalyticsService?.close();
+  // The dashboard is the sole gate owner. Daemons intentionally never stop
+  // this singleton, so a non-owner daemon shutdown cannot tear down 18181.
+  stopMemoryGateSync();
   if (oauthCallbackServer.listening) oauthCallbackServer.close();
   server.close(() => process.exit(gracefulProcessExitCode()));
   // Hard-exit fallback after 5s

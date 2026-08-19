@@ -4,7 +4,10 @@ import { parse } from 'dotenv';
 // MUST stay mirrored by detachedRestartEnv() in src/core/maintenance.ts: any key
 // added here also has to be stripped there, or a detached restart (dashboard
 // update/restart, maintenance auto-update) reuses the stale baked value instead
-// of reloading it from ~/.botmux/.env.
+// of reloading it from ~/.botmux/.env. Both OpenMemory secrets are
+// intentionally kept outside this fleet-wide list: the dashboard reads them
+// only for its gate, while daemons use a narrow permission-checked signer
+// lookup when they need to mint a capability.
 const DAEMON_ENV_KEYS = [
   'WEB_EXTERNAL_HOST',
   'BOTMUX_DASHBOARD_EXTERNAL_HOST',
