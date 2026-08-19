@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   decryptCredentialUtf8,
@@ -875,6 +875,7 @@ describe('T6 Codex Podman status probe', () => {
     const log = join(dir, 'podman-args.log');
     writeFileSync(command, `#!/bin/sh
 printf '%s\\n' "$@" >> ${JSON.stringify(log)}
+printf 'HOME=%s\\n' "$HOME" >> ${JSON.stringify(join(dir, 'podman-env.log'))}
 if [ "$1" = "run" ]; then
   ${runBody}
 fi
@@ -915,6 +916,7 @@ exit 0
     expect(args).not.toContain('--network=host');
     expect(args).not.toContain('--publish');
     expect(args).toContain('rm\n--force\n--ignore');
+    expect(readFileSync(join(dir, 'podman-env.log'), 'utf8')).toContain(`HOME=${homedir()}\n`);
   });
 
   it('starts device auth through the codex entrypoint without a duplicate executable', async () => {

@@ -159,7 +159,10 @@ export class PodmanCodexDeviceAuthRunner implements CodexDeviceAuthRunner {
   private podmanEnv(): Readonly<Record<string, string>> {
     return {
       PATH: process.env.PATH ?? '/usr/bin:/bin',
-      HOME: '/tmp',
+      // Podman itself runs on the host, so rootless storage (including the
+      // digest-pinned image) is resolved from the invoking user's home. The
+      // container still receives its own HOME/CODEX_HOME through args().
+      HOME: homedir(),
       LANG: process.env.LANG ?? 'C.UTF-8',
       LC_ALL: process.env.LC_ALL ?? 'C.UTF-8',
     };
@@ -196,12 +199,7 @@ export class PodmanCodexDeviceAuthRunner implements CodexDeviceAuthRunner {
     await this.dispose({ authPath });
     const child = spawn(this.command, this.args(authPath, ['login', '--device-auth'], 'rw'), {
       cwd: this.authRoot,
-      env: {
-        PATH: process.env.PATH ?? '/usr/bin:/bin',
-        HOME: '/tmp',
-        LANG: process.env.LANG ?? 'C.UTF-8',
-        LC_ALL: process.env.LC_ALL ?? 'C.UTF-8',
-      },
+      env: this.podmanEnv(),
       shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
