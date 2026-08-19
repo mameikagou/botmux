@@ -87,6 +87,10 @@ export interface SessionRuntimePaths {
   readonly workspaceRoot: string;
   readonly homeRoot: string;
   readonly outboxRoot: string;
+  /** Per-session writable qlib staging area. It is nested under the
+   * read-only quant-data bind at container time, but never lives in the
+   * central host dataRoot. */
+  readonly stagingRoot: string;
   readonly runtimeStateRoot: string;
   readonly credentialCacheRoot: string;
   readonly codexCredentialRoot: string;
@@ -99,7 +103,7 @@ export interface PodmanMountPlan {
   readonly source: string;
   readonly target: string;
   readonly mode: PodmanMountMode;
-  readonly kind: 'workspace' | 'home' | 'outbox' | 'quant-data' | 'investment-books' | 'codex-auth';
+  readonly kind: 'workspace' | 'home' | 'outbox' | 'quant-data' | 'quant-data-staging' | 'investment-books' | 'codex-auth';
   /** True only for the Codex auth.json leaf mount. */
   readonly singleFile?: true;
 }
@@ -132,7 +136,7 @@ export interface CredentialEnvironmentVariable {
 
 export interface CredentialProviderConfigPlan {
   readonly path: string;
-  readonly format: 'json';
+  readonly format: 'json' | 'codex-toml';
   readonly cliId: PodmanCliId;
   readonly credentialKind: 'api';
   readonly baseUrl: string;
@@ -398,6 +402,7 @@ export function buildSessionRuntimePaths(
     workspaceRoot: join(sessionRoot, 'workspace'),
     homeRoot: join(sessionRoot, 'home'),
     outboxRoot: join(sessionRoot, 'outbox'),
+    stagingRoot: join(sessionRoot, 'staging'),
     runtimeStateRoot: join(sessionRoot, 'runtime'),
     credentialCacheRoot,
     codexCredentialRoot,
@@ -459,7 +464,9 @@ function credentialContract(cliId: PodmanCliId): {
         secretEnvVar: 'OPENAI_API_KEY',
         baseUrlEnvVar: 'OPENAI_BASE_URL',
         modelEnvVar: 'OPENAI_MODEL',
-        configRelativePath: '.agent/providers/codex.json',
+        // Codex reads provider selection from CODEX_HOME/config.toml.  The
+        // generic .agent/providers JSON is not part of Codex's schema.
+        configRelativePath: '.codex/config.toml',
       };
     case 'claude-code':
       return {
@@ -579,7 +586,7 @@ export function buildCredentialInjectionPlan(input: {
     secretEnvVar: contract.secretEnvVar,
     providerConfig: {
       path: providerConfigPath,
-      format: 'json',
+      format: cliId === 'codex' ? 'codex-toml' : 'json',
       cliId,
       credentialKind: 'api',
       baseUrl,
@@ -624,6 +631,7 @@ function assertRuntimePaths(config: PodmanExecutionConfig, runtime: SessionRunti
     workspaceRoot: join(expectedSessionRoot, 'workspace'),
     homeRoot: join(expectedSessionRoot, 'home'),
     outboxRoot: join(expectedSessionRoot, 'outbox'),
+    stagingRoot: join(expectedSessionRoot, 'staging'),
     runtimeStateRoot: join(expectedSessionRoot, 'runtime'),
     credentialCacheRoot: expectedCredentialRoot,
     codexCredentialRoot: join(expectedCredentialRoot, 'codex'),
@@ -652,6 +660,10 @@ export function buildPodmanMountPlan(
     { source: runtime.homeRoot, target: '/home/dev', mode: 'rw', kind: 'home' },
     { source: runtime.outboxRoot, target: '/session/outbox', mode: 'rw', kind: 'outbox' },
     { source: validatedConfig.dataRoot, target: '/shared/quant-data', mode: 'ro', kind: 'quant-data' },
+    // qlib's data directory is a symlink to the read-only central lake. This
+    // nested bind is the sole writable exception and is private per session;
+    // it must appear after the parent bind so Podman overlays this leaf.
+    { source: runtime.stagingRoot, target: '/shared/quant-data/staging', mode: 'rw', kind: 'quant-data-staging' },
     { source: validatedConfig.knowledgeRoot, target: '/knowledge/investment-books', mode: 'ro', kind: 'investment-books' },
   ];
   for (const mount of base) validateMountSource(mount.source, mount.kind);

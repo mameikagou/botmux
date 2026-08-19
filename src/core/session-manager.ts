@@ -82,6 +82,7 @@ import { beginReplyTargetTurn } from './reply-target.js';
 import { readDeferredTopicBinding, removeDeferredTopicBinding } from './deferred-topic-binding.js';
 import { escapeXmlTagLikeTokens } from '../utils/xml.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
+import { ensureSandboxPrincipalForFork } from './agent-principal-runtime.js';
 
 export { getAttachmentsDir } from './attachment-path.js';
 
@@ -171,6 +172,13 @@ async function resumeRestoredPendingRepoSetup(
   // selectable repo. Resume the same no-project fallback without replacing N.
   ds.pendingRepo = false;
   ensureSessionWhiteboard(ds);
+  const pendingBotCfg = getBot(ds.larkAppId).config;
+  await ensureSandboxPrincipalForFork({
+    ds,
+    execution: pendingBotCfg.execution,
+    cliId: pendingBotCfg.cliId,
+    persist: session => sessionStore.updateSession(session),
+  });
   if (setup.rawInput) {
     rememberLastCliInput(ds, setup.rawInput, setup.rawInput);
     forkWorker(ds, '', { resume: false, turnId: setup.turnId });
@@ -1516,7 +1524,7 @@ const RECOVERY_FORK_DELAY_MS = config.daemon.recoveryForkDelayMs ?? 250;
  */
 export async function staggeredRecoveryFork(
   sessions: readonly DaemonSession[],
-  fork: (ds: DaemonSession) => void,
+  fork: (ds: DaemonSession) => void | Promise<void>,
   batchSize: number = RECOVERY_FORK_BATCH_SIZE,
   delayMs: number = RECOVERY_FORK_DELAY_MS,
   stillOwned: (ds: DaemonSession) => boolean = ds => ds.session.status === 'active',
@@ -1527,7 +1535,7 @@ export async function staggeredRecoveryFork(
     // exact object while we sleep. Never resurrect a closed or orphaned ds.
     if (ds.worker || ds.session.status !== 'active' || !stillOwned(ds)) continue;
     try {
-      fork(ds);
+      await fork(ds);
     } catch (err) {
       // One malformed/stale pane or synchronous init-IPC failure must not
       // abort recovery for every later durable owner. forkWorker compensates
@@ -2240,7 +2248,7 @@ export async function restoreActiveSessions(
   // only, no new turn — same as the old per-session eager fork.
   await staggeredRecoveryFork(
     toReattach,
-    (ds) => {
+    async (ds) => {
       // A quarantined tail-only owner (restore promotion failed transiently) is
       // handled by the CENTRAL guard inside forkWorker: this blank fork retries
       // the old head's promotion first and, if it still fails, refuses to fork
@@ -2253,6 +2261,13 @@ export async function restoreActiveSessions(
       const recoverExactNonCodex = ds.session.queuedActivationPending
         && ds.session.cliId !== 'codex-app'
         && ds.session.queuedActivationInput;
+      const botCfg = getBot(ds.larkAppId).config;
+      await ensureSandboxPrincipalForFork({
+        ds,
+        execution: botCfg.execution,
+        cliId: botCfg.cliId,
+        persist: session => sessionStore.updateSession(session),
+      });
       forkWorker(
         ds,
         recoverExactNonCodex || '',
@@ -2320,6 +2335,13 @@ export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<numbe
     // still fails — waking a blank worker beside an unpromoted tail would wedge
     // the FIFO gate. Report unavailable (the terminal retries / 502s) instead of
     // blocking 10s for a port that will never arrive.
+    const botCfg = getBot(ds.larkAppId).config;
+    await ensureSandboxPrincipalForFork({
+      ds,
+      execution: botCfg.execution,
+      cliId: botCfg.cliId,
+      persist: session => sessionStore.updateSession(session),
+    });
     if (!forkWorker(ds, '', true)) {
       logger.warn(`[${ds.session.sessionId.substring(0, 8)}] terminal wake refused (quarantined tail-only owner); serving unavailable`);
       return undefined;
@@ -2962,6 +2984,12 @@ export async function executeScheduledTask(
           throw new Error(`scheduled continuation lost active session ${existing.session.sessionId}`);
         }
         try {
+          await ensureSandboxPrincipalForFork({
+            ds: existing,
+            execution: bot.config.execution,
+            cliId: bot.config.cliId,
+            persist: session => sessionStore.updateSession(session),
+          });
           forkWorker(existing, input, { resume: existing.hasHistory, turnId: scheduledTurnId });
         } catch (err) {
           if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
@@ -3048,6 +3076,12 @@ export async function executeScheduledTask(
     rememberLastCliInput(ds, task.prompt, prompt);
     if (silent) armSilentScheduledTurn(ds, scheduledTurnId);
     try {
+      await ensureSandboxPrincipalForFork({
+        ds,
+        execution: bot.config.execution,
+        cliId: bot.config.cliId,
+        persist: session => sessionStore.updateSession(session),
+      });
       forkWorker(ds, prompt, scheduledTurnId);
     } catch (err) {
       if (silent) disarmSilentScheduledTurn(ds, scheduledTurnId);
@@ -3207,6 +3241,12 @@ async function forkOrShowRepoCard(
   ensureSessionWhiteboard(ds);
   const prompt = buildPrompt();
   rememberLastCliInput(ds, userContent, prompt);
+  await ensureSandboxPrincipalForFork({
+    ds,
+    execution: bot.config.execution,
+    cliId: bot.config.cliId,
+    persist: session => sessionStore.updateSession(session),
+  });
   forkWorker(ds, prompt);
   // forkWorker pre-accept is synchronous. Keep the reservation and all input
   // buffers intact if it throws; only expose the normal worker state after it
@@ -3512,6 +3552,13 @@ export async function activateQueuedSession(ds: DaemonSession): Promise<{ ok: bo
     try {
       const exactRetry = ds.session.queuedActivationInput;
       if (exactRetry) {
+        const botCfg = getBot(ds.larkAppId).config;
+        await ensureSandboxPrincipalForFork({
+          ds,
+          execution: botCfg.execution,
+          cliId: botCfg.cliId,
+          persist: session => sessionStore.updateSession(session),
+        });
         forkWorker(ds, exactRetry, {
           resume: ds.session.queuedActivationResume ?? ds.hasHistory,
           turnId: ds.session.queuedActivationTurnId,

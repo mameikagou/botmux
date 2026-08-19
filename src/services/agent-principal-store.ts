@@ -1,0 +1,734 @@
+/** PostgreSQL authority for shared-sandbox principals and BYOK credentials. */
+import { createRequire } from 'node:module';
+import { validateApiCredentialInput, type ApiCredentialInput } from './agent-credential-policy.js';
+import {
+  credentialFingerprint,
+  decryptCredentialUtf8,
+  encryptCredential,
+} from './agent-principal-crypto.js';
+import { assertCredentialCompatible, type PodmanCliId, type PodmanCredentialKind } from '../execution/podman-execution.js';
+
+export const AGENT_PRINCIPAL_MIGRATION_ID = '20260819_agent_principals_v1';
+
+export interface SqlResult<Row = Record<string, unknown>> {
+  readonly rows: Row[];
+  readonly rowCount?: number;
+}
+
+export interface SqlExecutor {
+  query<Row = Record<string, unknown>>(text: string, values?: readonly unknown[]): Promise<SqlResult<Row>>;
+}
+
+export interface SqlTransaction extends SqlExecutor {
+  release(): void;
+}
+
+export interface SqlPool extends SqlExecutor {
+  connect(): Promise<SqlTransaction>;
+  end?(): Promise<void>;
+}
+
+export interface AgentPrincipalKey {
+  readonly larkAppId: string;
+  readonly openId: string;
+}
+
+export interface AgentPrincipalRow extends AgentPrincipalKey {
+  readonly enabled: boolean;
+  readonly canOpenMemory: boolean;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface AgentCredentialMetadata extends AgentPrincipalKey {
+  readonly credentialKind: PodmanCredentialKind;
+  readonly baseUrl?: string;
+  readonly model?: string;
+  readonly credentialVersion: number;
+  readonly updatedAt: string;
+  readonly keyFingerprint?: string;
+}
+
+export interface AgentCredentialRecord extends AgentCredentialMetadata {
+  readonly encryptedSecret: Buffer;
+  readonly secretNonce: Buffer;
+}
+
+export interface AgentCodexLoginTaskRecord {
+  readonly taskId: string;
+  readonly key: AgentPrincipalKey;
+  readonly status: 'pending' | 'ready' | 'failed' | 'logged_out' | 'expired';
+  readonly leaseExpiresAt: string;
+  readonly verificationUri?: string;
+  readonly userCode?: string;
+  readonly errorCode?: string;
+}
+
+/** Session-persisted and non-secret. Never add the decrypted secret here. */
+export interface FrozenPrincipalBinding extends AgentPrincipalKey {
+  readonly enabled: true;
+  readonly canOpenMemory: boolean;
+  readonly cliId: PodmanCliId;
+  readonly credentialVersion: number;
+  readonly credentialKind: PodmanCredentialKind;
+  readonly ownerOpenId?: string;
+}
+
+/** Session-persisted credential metadata. */
+export interface FrozenCredentialBinding {
+  readonly kind: PodmanCredentialKind;
+  readonly credentialVersion: number;
+  readonly baseUrl?: string;
+  readonly model?: string;
+}
+
+export type AgentPrincipalLookupFailureCode = 'not_found' | 'disabled' | 'credential_missing' | 'credential_incompatible' | 'database_unavailable';
+
+export class AgentPrincipalLookupError extends Error {
+  readonly code: AgentPrincipalLookupFailureCode;
+  constructor(code: AgentPrincipalLookupFailureCode, message: string = code) {
+    super(message);
+    this.name = 'AgentPrincipalLookupError';
+    this.code = code;
+  }
+}
+
+export class CredentialVersionConflictError extends Error {
+  readonly expectedVersion: number;
+  readonly actualVersion?: number;
+  constructor(expectedVersion: number, actualVersion?: number) {
+    super('credential_version_conflict');
+    this.name = 'CredentialVersionConflictError';
+    this.expectedVersion = expectedVersion;
+    this.actualVersion = actualVersion;
+  }
+}
+
+export class CodexLoginTaskConflictError extends Error {
+  constructor() {
+    super('codex_login_task_conflict');
+    this.name = 'CodexLoginTaskConflictError';
+  }
+}
+
+/**
+ * Domain errors that have already crossed our sanitization boundary. Every
+ * other error in a transaction may be a driver/SQL error and must be reduced
+ * to the generic database-unavailable result before it reaches a caller.
+ */
+function isSanitizedDomainError(
+  error: unknown,
+): error is AgentPrincipalLookupError | CredentialVersionConflictError | CodexLoginTaskConflictError {
+  return error instanceof AgentPrincipalLookupError
+    || error instanceof CredentialVersionConflictError
+    || error instanceof CodexLoginTaskConflictError;
+}
+
+export const AGENT_PRINCIPAL_UP_SQL = `
+CREATE TABLE IF NOT EXISTS agent_principals (
+  lark_app_id text NOT NULL,
+  open_id text NOT NULL,
+  enabled boolean NOT NULL DEFAULT true,
+  can_openmemory boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (lark_app_id, open_id),
+  CHECK (length(trim(lark_app_id)) > 0),
+  CHECK (length(trim(open_id)) > 0)
+);
+`;
+
+export const AGENT_CREDENTIAL_UP_SQL = `
+CREATE TABLE IF NOT EXISTS agent_model_credentials (
+  lark_app_id text NOT NULL,
+  open_id text NOT NULL,
+  credential_kind text NOT NULL CHECK (credential_kind IN ('codex_chatgpt', 'api')),
+  base_url text,
+  model text,
+  encrypted_secret bytea NOT NULL,
+  secret_nonce bytea NOT NULL,
+  credential_version bigint NOT NULL DEFAULT 1 CHECK (credential_version > 0),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (lark_app_id, open_id),
+  FOREIGN KEY (lark_app_id, open_id)
+    REFERENCES agent_principals (lark_app_id, open_id)
+    ON UPDATE CASCADE ON DELETE CASCADE,
+  CHECK ((credential_kind = 'api' AND length(trim(coalesce(base_url, ''))) > 0 AND length(trim(coalesce(model, ''))) > 0)
+      OR (credential_kind = 'codex_chatgpt' AND base_url IS NULL AND model IS NULL))
+);
+`;
+
+/** Login tasks are narrow, short-lived coordination state, never auth data. */
+export const AGENT_LOGIN_TASK_UP_SQL = `
+CREATE TABLE IF NOT EXISTS agent_codex_login_tasks (
+  task_id uuid PRIMARY KEY,
+  lark_app_id text NOT NULL,
+  open_id text NOT NULL,
+  status text NOT NULL CHECK (status IN ('pending', 'ready', 'failed', 'logged_out', 'expired')),
+  lease_expires_at timestamptz NOT NULL,
+  verification_uri text,
+  user_code text,
+  error_code text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  FOREIGN KEY (lark_app_id, open_id)
+    REFERENCES agent_principals (lark_app_id, open_id)
+    ON UPDATE CASCADE ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS agent_codex_login_tasks_live_idx
+  ON agent_codex_login_tasks (lark_app_id, open_id)
+  WHERE status = 'pending';
+`;
+
+export const AGENT_PRINCIPAL_DOWN_SQL = `
+DROP TABLE IF EXISTS agent_codex_login_tasks;
+DROP TABLE IF EXISTS agent_model_credentials;
+DROP TABLE IF EXISTS agent_principals;
+`;
+
+async function withAgentPrincipalTransaction<T>(db: SqlExecutor, operation: (tx: SqlExecutor) => Promise<T>): Promise<T> {
+  // PostgreSQL transactions are connection-scoped.  A Pool's `query` method
+  // may dispatch each statement to a different idle connection, so migrations
+  // and login-task fencing must pin one client for their whole transaction.
+  const connect = (db as Partial<SqlPool>).connect;
+  if (typeof connect === 'function') {
+    let client: SqlTransaction;
+    try {
+      client = await connect.call(db);
+    } catch (error) {
+      throw toDbError(error);
+    }
+    try {
+      await client.query('BEGIN');
+      const result = await operation(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      if (isSanitizedDomainError(error)) throw error;
+      throw toDbError(error);
+    } finally {
+      client.release();
+    }
+  }
+  await db.query('BEGIN');
+  try {
+    const result = await operation(db);
+    await db.query('COMMIT');
+    return result;
+  } catch (error) {
+    await db.query('ROLLBACK').catch(() => undefined);
+    if (isSanitizedDomainError(error)) throw error;
+    throw toDbError(error);
+  }
+}
+
+export async function applyAgentPrincipalMigration(db: SqlExecutor): Promise<void> {
+  await withAgentPrincipalTransaction(db, async tx => {
+    await tx.query(AGENT_PRINCIPAL_UP_SQL);
+    await tx.query(AGENT_CREDENTIAL_UP_SQL);
+    await tx.query(AGENT_LOGIN_TASK_UP_SQL);
+  });
+}
+
+export async function rollbackAgentPrincipalMigration(db: SqlExecutor): Promise<void> {
+  await withAgentPrincipalTransaction(db, tx => tx.query(AGENT_PRINCIPAL_DOWN_SQL).then(() => undefined));
+}
+
+function textKey(value: string, name: string): string {
+  if (typeof value !== 'string' || value.trim() === '' || /[\u0000\r\n]/u.test(value)) {
+    throw new TypeError(`${name} must be a non-empty string`);
+  }
+  return value.trim();
+}
+
+function keyValues(key: AgentPrincipalKey): [string, string] {
+  return [textKey(key.larkAppId, 'larkAppId'), textKey(key.openId, 'openId')];
+}
+
+function boolValue(raw: unknown, fallback = false): boolean {
+  return typeof raw === 'boolean' ? raw : raw === 't' ? true : raw === 'f' ? false : fallback;
+}
+
+function dateValue(raw: unknown): string {
+  return raw instanceof Date ? raw.toISOString() : typeof raw === 'string' ? raw : new Date(0).toISOString();
+}
+
+function parsePrincipal(row: Record<string, unknown>): AgentPrincipalRow {
+  return {
+    larkAppId: String(row.lark_app_id),
+    openId: String(row.open_id),
+    enabled: boolValue(row.enabled),
+    canOpenMemory: boolValue(row.can_openmemory),
+    createdAt: dateValue(row.created_at),
+    updatedAt: dateValue(row.updated_at),
+  };
+}
+
+function parseCredential(row: Record<string, unknown>): AgentCredentialRecord {
+  const bytes = (value: unknown): Buffer => {
+    if (Buffer.isBuffer(value)) return value;
+    if (value instanceof Uint8Array) return Buffer.from(value);
+    if (typeof value === 'string') {
+      // node-postgres normally returns bytea as Buffer, but a few test and
+      // proxy adapters expose it as hex text.
+      const hex = value.startsWith('\\x') ? value.slice(2) : value;
+      if (/^[0-9a-f]+$/iu.test(hex) && hex.length % 2 === 0) return Buffer.from(hex, 'hex');
+      return Buffer.from(value, 'base64');
+    }
+    throw new TypeError('credential bytes are invalid');
+  };
+  const encryptedSecret = bytes(row.encrypted_secret);
+  const secretNonce = bytes(row.secret_nonce);
+  return {
+    larkAppId: String(row.lark_app_id),
+    openId: String(row.open_id),
+    credentialKind: String(row.credential_kind) as PodmanCredentialKind,
+    ...(typeof row.base_url === 'string' ? { baseUrl: row.base_url } : {}),
+    ...(typeof row.model === 'string' ? { model: row.model } : {}),
+    credentialVersion: Number(row.credential_version),
+    updatedAt: dateValue(row.updated_at),
+    encryptedSecret,
+    secretNonce,
+  };
+}
+
+function parseLoginTask(row: Record<string, unknown>): AgentCodexLoginTaskRecord {
+  const status = String(row.status);
+  if (status !== 'pending' && status !== 'ready' && status !== 'failed' && status !== 'logged_out' && status !== 'expired') {
+    throw new TypeError('invalid Codex login task status');
+  }
+  return {
+    taskId: String(row.task_id),
+    key: { larkAppId: String(row.lark_app_id), openId: String(row.open_id) },
+    status,
+    leaseExpiresAt: dateValue(row.lease_expires_at),
+    ...(typeof row.verification_uri === 'string' ? { verificationUri: row.verification_uri } : {}),
+    ...(typeof row.user_code === 'string' ? { userCode: row.user_code } : {}),
+    ...(typeof row.error_code === 'string' ? { errorCode: row.error_code } : {}),
+  };
+}
+
+function toDbError(error: unknown): AgentPrincipalLookupError {
+  // Repository policy failures are already sanitized and meaningful to the
+  // caller. Do not turn a disabled/not-found principal into a misleading
+  // database outage merely because the surrounding operation has a generic
+  // error boundary.
+  if (error instanceof AgentPrincipalLookupError) return error;
+  return new AgentPrincipalLookupError(
+    'database_unavailable',
+    // Never copy a driver error to a bot/dashboard boundary: libpq messages
+    // can include a full postgres:// DSN (and therefore a password). Keep the
+    // diagnostic deliberately generic; operators can inspect the DB service.
+    'agent principal database unavailable',
+  );
+}
+
+export class AgentPrincipalRepository {
+  constructor(
+    private readonly db: SqlPool,
+    private readonly masterKey?: Buffer,
+  ) {}
+
+  async getPrincipal(key: AgentPrincipalKey): Promise<AgentPrincipalRow | undefined> {
+    const [appId, openId] = keyValues(key);
+    try {
+      const result = await this.db.query<Record<string, unknown>>(
+        `SELECT lark_app_id, open_id, enabled, can_openmemory, created_at, updated_at
+           FROM agent_principals WHERE lark_app_id = $1 AND open_id = $2`,
+        [appId, openId],
+      );
+      return result.rows[0] ? parsePrincipal(result.rows[0]) : undefined;
+    } catch (error) {
+      throw toDbError(error);
+    }
+  }
+
+  async getCredential(key: AgentPrincipalKey): Promise<AgentCredentialRecord | undefined> {
+    const [appId, openId] = keyValues(key);
+    try {
+      // Credential reads are principal operations too. Keep the repository
+      // fail-closed even when a caller bypasses the narrow dashboard API.
+      await this.requireEnabled(this.db, key);
+      const result = await this.db.query<Record<string, unknown>>(
+        `SELECT lark_app_id, open_id, credential_kind, base_url, model,
+                encrypted_secret, secret_nonce, credential_version, updated_at
+           FROM agent_model_credentials WHERE lark_app_id = $1 AND open_id = $2`,
+        [appId, openId],
+      );
+      return result.rows[0] ? parseCredential(result.rows[0]) : undefined;
+    } catch (error) {
+      throw toDbError(error);
+    }
+  }
+
+  /** The only new-instance lookup. Callers must persist its result on Session. */
+  async resolveForNewInstance(input: {
+    readonly key: AgentPrincipalKey;
+    readonly cliId: string;
+    readonly ownerOpenId?: string;
+    readonly adminOverride?: boolean;
+  }): Promise<{ principal: AgentPrincipalRow; credential: AgentCredentialRecord; principalBinding: FrozenPrincipalBinding; credentialBinding: FrozenCredentialBinding; credentialSecret: string }> {
+    const key = { larkAppId: textKey(input.key.larkAppId, 'larkAppId'), openId: textKey(input.key.openId, 'openId') };
+    const [appId, openId] = keyValues(key);
+    let result: SqlResult<Record<string, unknown>>;
+    try {
+      result = await this.db.query<Record<string, unknown>>(
+        `SELECT p.lark_app_id, p.open_id, p.enabled, p.can_openmemory,
+                p.created_at, p.updated_at,
+                c.credential_kind, c.base_url, c.model, c.encrypted_secret,
+                c.secret_nonce, c.credential_version, c.updated_at AS credential_updated_at
+           FROM agent_principals p
+           LEFT JOIN agent_model_credentials c
+             ON c.lark_app_id = p.lark_app_id AND c.open_id = p.open_id
+          WHERE p.lark_app_id = $1 AND p.open_id = $2`,
+        [appId, openId],
+      );
+    } catch (error) {
+      throw toDbError(error);
+    }
+    const row = result.rows[0];
+    if (!row) throw new AgentPrincipalLookupError('not_found', 'principal is not registered for this Lark app');
+    const principal = parsePrincipal(row);
+    if (!principal.enabled) throw new AgentPrincipalLookupError('disabled', 'principal is disabled');
+    if (input.ownerOpenId && input.ownerOpenId !== openId && !input.adminOverride) {
+      throw new AgentPrincipalLookupError('disabled', 'session owner does not match the requesting principal');
+    }
+    if (!row.credential_kind || row.encrypted_secret === undefined || row.secret_nonce === undefined) {
+      throw new AgentPrincipalLookupError('credential_missing', 'no compatible model credential is configured');
+    }
+    const credential = parseCredential({
+      ...row,
+      updated_at: row.credential_updated_at,
+    });
+    try { assertCredentialCompatible(input.cliId, credential.credentialKind); } catch {
+      throw new AgentPrincipalLookupError('credential_incompatible', 'model credential is incompatible with this fixed bot harness');
+    }
+    if (!this.masterKey) throw new AgentPrincipalLookupError('database_unavailable', 'credential master key is not configured');
+    const credentialSecret = decryptCredentialUtf8(
+      { ciphertext: credential.encryptedSecret, nonce: credential.secretNonce },
+      this.masterKey,
+      key,
+    );
+    const principalBinding: FrozenPrincipalBinding = {
+      ...key,
+      enabled: true,
+      canOpenMemory: principal.canOpenMemory,
+      cliId: input.cliId as PodmanCliId,
+      credentialVersion: credential.credentialVersion,
+      credentialKind: credential.credentialKind,
+      ...(input.ownerOpenId ? { ownerOpenId: input.ownerOpenId } : {}),
+    };
+    const credentialBinding: FrozenCredentialBinding = {
+      kind: credential.credentialKind,
+      credentialVersion: credential.credentialVersion,
+      ...(credential.baseUrl ? { baseUrl: credential.baseUrl } : {}),
+      ...(credential.model ? { model: credential.model } : {}),
+    };
+    return { principal, credential, principalBinding, credentialBinding, credentialSecret };
+  }
+
+  async upsertPrincipal(input: {
+    readonly key: AgentPrincipalKey;
+    readonly enabled?: boolean;
+    readonly canOpenMemory?: boolean;
+  }): Promise<AgentPrincipalRow> {
+    const [appId, openId] = keyValues(input.key);
+    try {
+      const result = await this.db.query<Record<string, unknown>>(
+        `INSERT INTO agent_principals (lark_app_id, open_id, enabled, can_openmemory)
+         VALUES ($1, $2, COALESCE($3, true), COALESCE($4, false))
+         ON CONFLICT (lark_app_id, open_id) DO UPDATE SET
+           enabled = COALESCE($3, agent_principals.enabled),
+           can_openmemory = COALESCE($4, agent_principals.can_openmemory),
+           updated_at = now()
+         RETURNING lark_app_id, open_id, enabled, can_openmemory, created_at, updated_at`,
+        [appId, openId, input.enabled ?? null, input.canOpenMemory ?? null],
+      );
+      return parsePrincipal(result.rows[0]!);
+    } catch (error) {
+      throw toDbError(error);
+    }
+  }
+
+  async setPrincipalEnabled(key: AgentPrincipalKey, enabled: boolean): Promise<AgentPrincipalRow | undefined> {
+    const [appId, openId] = keyValues(key);
+    try {
+      const result = await this.db.query<Record<string, unknown>>(
+        `UPDATE agent_principals SET enabled = $3, updated_at = now()
+          WHERE lark_app_id = $1 AND open_id = $2
+          RETURNING lark_app_id, open_id, enabled, can_openmemory, created_at, updated_at`,
+        [appId, openId, enabled],
+      );
+      return result.rows[0] ? parsePrincipal(result.rows[0]) : undefined;
+    } catch (error) {
+      throw toDbError(error);
+    }
+  }
+
+  async setOpenMemory(key: AgentPrincipalKey, canOpenMemory: boolean): Promise<AgentPrincipalRow | undefined> {
+    const [appId, openId] = keyValues(key);
+    try {
+      const result = await this.db.query<Record<string, unknown>>(
+        `UPDATE agent_principals SET can_openmemory = $3, updated_at = now()
+          WHERE lark_app_id = $1 AND open_id = $2
+          RETURNING lark_app_id, open_id, enabled, can_openmemory, created_at, updated_at`,
+        [appId, openId, canOpenMemory],
+      );
+      return result.rows[0] ? parsePrincipal(result.rows[0]) : undefined;
+    } catch (error) {
+      throw toDbError(error);
+    }
+  }
+
+  async putCredential(input: {
+    readonly key: AgentPrincipalKey;
+    readonly credentialKind: PodmanCredentialKind;
+    readonly secret: string | Buffer;
+    readonly baseUrl?: string;
+    readonly model?: string;
+    readonly expectedVersion?: number;
+  }): Promise<AgentCredentialMetadata> {
+    const key = { larkAppId: textKey(input.key.larkAppId, 'larkAppId'), openId: textKey(input.key.openId, 'openId') };
+    const [appId, openId] = keyValues(key);
+    if (!this.masterKey) throw new Error('credential master key is not configured');
+    if (input.credentialKind === 'api') {
+      validateApiCredentialInput({ baseUrl: input.baseUrl ?? '', model: input.model ?? '', key: typeof input.secret === 'string' ? input.secret : input.secret.toString('utf8') });
+    } else if (input.baseUrl !== undefined || input.model !== undefined) {
+      throw new TypeError('Codex ChatGPT credentials do not accept BaseURL or model');
+    }
+    const encrypted = encryptCredential(input.secret, this.masterKey, key);
+    let client: SqlTransaction;
+    try {
+      client = await this.db.connect();
+    } catch (error) {
+      throw toDbError(error);
+    }
+    try {
+      await client.query('BEGIN');
+      // Lock the parent row before reading the optional credential row. A
+      // missing child row has no lock of its own, so two first writers would
+      // otherwise both observe version 0 and race through the INSERT.
+      await this.requireEnabled(client, key, true);
+      const current = await client.query<Record<string, unknown>>(
+        `SELECT credential_version FROM agent_model_credentials
+          WHERE lark_app_id = $1 AND open_id = $2 FOR UPDATE`, [appId, openId],
+      );
+      const actual = current.rows[0] ? Number(current.rows[0].credential_version) : undefined;
+      // Version zero is the explicit create-if-absent sentinel.  Treat a
+      // missing row as version 0 so two first writers cannot both win.
+      if (input.expectedVersion !== undefined && (actual ?? 0) !== input.expectedVersion) {
+        throw new CredentialVersionConflictError(input.expectedVersion, actual);
+      }
+      const nextVersion = actual === undefined ? 1 : actual + 1;
+      const result = await client.query<Record<string, unknown>>(
+        `INSERT INTO agent_model_credentials
+           (lark_app_id, open_id, credential_kind, base_url, model, encrypted_secret, secret_nonce, credential_version)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (lark_app_id, open_id) DO UPDATE SET
+           credential_kind = EXCLUDED.credential_kind,
+           base_url = EXCLUDED.base_url,
+           model = EXCLUDED.model,
+           encrypted_secret = EXCLUDED.encrypted_secret,
+           secret_nonce = EXCLUDED.secret_nonce,
+           credential_version = EXCLUDED.credential_version,
+           updated_at = now()
+         RETURNING lark_app_id, open_id, credential_kind, base_url, model, credential_version, updated_at`,
+        [appId, openId, input.credentialKind, input.baseUrl ?? null, input.model ?? null, encrypted.ciphertext, encrypted.nonce, nextVersion],
+      );
+      await client.query('COMMIT');
+      const row = result.rows[0]!;
+      return {
+        larkAppId: String(row.lark_app_id), openId: String(row.open_id),
+        credentialKind: String(row.credential_kind) as PodmanCredentialKind,
+        ...(typeof row.base_url === 'string' ? { baseUrl: row.base_url } : {}),
+        ...(typeof row.model === 'string' ? { model: row.model } : {}),
+        credentialVersion: Number(row.credential_version), updatedAt: dateValue(row.updated_at),
+        keyFingerprint: credentialFingerprint(input.secret),
+      };
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      if (error instanceof CredentialVersionConflictError) throw error;
+      throw toDbError(error);
+    } finally {
+      client.release();
+    }
+  }
+
+  async readSecret(key: AgentPrincipalKey, expectedVersion?: number): Promise<{ metadata: AgentCredentialMetadata; secret: string }> {
+    if (!this.masterKey) throw new Error('credential master key is not configured');
+    await this.requireEnabled(this.db, key);
+    const record = await this.getCredential(key);
+    if (!record) throw new AgentPrincipalLookupError('credential_missing', 'credential is not configured');
+    if (expectedVersion !== undefined && record.credentialVersion !== expectedVersion) {
+      throw new CredentialVersionConflictError(expectedVersion, record.credentialVersion);
+    }
+    const secret = decryptCredentialUtf8(
+      { ciphertext: record.encryptedSecret, nonce: record.secretNonce },
+      this.masterKey,
+      key,
+    );
+    const { encryptedSecret: _encrypted, secretNonce: _nonce, ...metadata } = record;
+    return { metadata, secret };
+  }
+
+  async deleteCredential(key: AgentPrincipalKey, expectedVersion?: number, credentialKind?: PodmanCredentialKind): Promise<boolean> {
+    const [appId, openId] = keyValues(key);
+    const values: unknown[] = [appId, openId];
+    const clauses: string[] = [];
+    if (expectedVersion !== undefined) {
+      values.push(expectedVersion);
+      clauses.push(`credential_version = $${values.length}`);
+    }
+    if (credentialKind !== undefined) {
+      values.push(credentialKind);
+      clauses.push(`credential_kind = $${values.length}`);
+    }
+    const guard = clauses.length > 0 ? ` AND ${clauses.join(' AND ')}` : '';
+    try {
+      await this.requireEnabled(this.db, key);
+      const result = await this.db.query(
+        `DELETE FROM agent_model_credentials WHERE lark_app_id = $1 AND open_id = $2${guard}`,
+        values,
+      );
+      if (expectedVersion !== undefined && Number(result.rowCount ?? 0) === 0) {
+        const current = await this.getCredential(key);
+        if (current && (credentialKind === undefined || current.credentialKind === credentialKind)) {
+          throw new CredentialVersionConflictError(expectedVersion, current.credentialVersion);
+        }
+      }
+      return Number(result.rowCount ?? 0) > 0;
+    } catch (error) {
+      if (error instanceof CredentialVersionConflictError) throw error;
+      throw toDbError(error);
+    }
+  }
+
+  async seedPrincipals(rows: ReadonlyArray<{ key: AgentPrincipalKey; canOpenMemory?: boolean; enabled?: boolean }>): Promise<AgentPrincipalRow[]> {
+    let client: SqlTransaction;
+    try {
+      client = await this.db.connect();
+    } catch (error) {
+      throw toDbError(error);
+    }
+    try {
+      await client.query('BEGIN');
+      const result: AgentPrincipalRow[] = [];
+      for (const row of rows) {
+        const [appId, openId] = keyValues(row.key);
+        const upserted = await client.query<Record<string, unknown>>(
+          `INSERT INTO agent_principals (lark_app_id, open_id, enabled, can_openmemory)
+           VALUES ($1, $2, COALESCE($3, true), COALESCE($4, false))
+           ON CONFLICT (lark_app_id, open_id) DO UPDATE SET
+             enabled = COALESCE($3, agent_principals.enabled),
+             can_openmemory = COALESCE($4, agent_principals.can_openmemory),
+             updated_at = now()
+           RETURNING lark_app_id, open_id, enabled, can_openmemory, created_at, updated_at`,
+          [appId, openId, row.enabled ?? null, row.canOpenMemory ?? null],
+        );
+        result.push(parsePrincipal(upserted.rows[0]!));
+      }
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw toDbError(error);
+    } finally {
+      client.release();
+    }
+  }
+
+  async beginCodexLoginTask(input: { key: AgentPrincipalKey; taskId: string; leaseExpiresAt: Date }): Promise<void> {
+    const [appId, openId] = keyValues(input.key);
+    try {
+      await withAgentPrincipalTransaction(this.db, async tx => {
+      await this.requireEnabled(tx, input.key);
+      // Expired rows are coordination history, not active leases. Reaping
+      // them here lets a principal start a new login without requiring a
+      // separate status poll first.
+      await tx.query(
+        `UPDATE agent_codex_login_tasks SET status = 'expired', error_code = 'device_auth_expired', updated_at = now()
+          WHERE lark_app_id = $1 AND open_id = $2 AND status = 'pending' AND lease_expires_at <= now()`,
+        [appId, openId],
+      );
+      const inserted = await tx.query(
+        `INSERT INTO agent_codex_login_tasks (task_id, lark_app_id, open_id, status, lease_expires_at)
+         VALUES ($1::uuid, $2, $3, 'pending', $4)
+         ON CONFLICT (lark_app_id, open_id) WHERE status = 'pending'
+         DO NOTHING
+         RETURNING task_id`,
+        [input.taskId, appId, openId, input.leaseExpiresAt],
+      );
+      if (Number(inserted.rowCount ?? inserted.rows.length) === 0) throw new CodexLoginTaskConflictError();
+      });
+    } catch (error) {
+      if (error instanceof CodexLoginTaskConflictError) throw error;
+      throw toDbError(error);
+    }
+  }
+
+  private async requireEnabled(db: SqlExecutor, key: AgentPrincipalKey, forUpdate = false): Promise<void> {
+    const [appId, openId] = keyValues(key);
+    let result: SqlResult<Record<string, unknown>>;
+    try {
+      result = await db.query<Record<string, unknown>>(
+        `SELECT enabled FROM agent_principals WHERE lark_app_id = $1 AND open_id = $2${forUpdate ? ' FOR UPDATE' : ''}`,
+        [appId, openId],
+      );
+    } catch (error) {
+      throw toDbError(error);
+    }
+    if (!result.rows[0]) throw new AgentPrincipalLookupError('not_found', 'principal is not registered for this Lark app');
+    if (!boolValue(result.rows[0].enabled)) throw new AgentPrincipalLookupError('disabled', 'principal is disabled');
+  }
+
+  async updateCodexLoginTask(taskId: string, input: { status: 'pending' | 'ready' | 'failed' | 'logged_out' | 'expired'; verificationUri?: string; userCode?: string; errorCode?: string }): Promise<void> {
+    try {
+      await this.db.query(
+        `UPDATE agent_codex_login_tasks SET status = $2, verification_uri = $3,
+           user_code = $4, error_code = $5, updated_at = now() WHERE task_id = $1::uuid`,
+        [taskId, input.status, input.verificationUri ?? null, input.userCode ?? null, input.errorCode ?? null],
+      );
+    } catch (error) {
+      throw toDbError(error);
+    }
+  }
+
+  async getCodexLoginTask(key: AgentPrincipalKey): Promise<AgentCodexLoginTaskRecord | undefined> {
+    const [appId, openId] = keyValues(key);
+    try {
+      const result = await this.db.query<Record<string, unknown>>(
+        `SELECT task_id, lark_app_id, open_id, status, lease_expires_at,
+                verification_uri, user_code, error_code
+           FROM agent_codex_login_tasks
+          WHERE lark_app_id = $1 AND open_id = $2
+          ORDER BY created_at DESC LIMIT 1`,
+        [appId, openId],
+      );
+      return result.rows[0] ? parseLoginTask(result.rows[0]) : undefined;
+    } catch (error) {
+      throw toDbError(error);
+    }
+  }
+}
+
+/**
+ * BOTMUX_AGENT_DATABASE_URL is an explicit override for deployments that keep
+ * identity/credentials in a separate Postgres database. In the default
+ * install, QRANT_RESEARCH_DATABASE_URL points at the same research DB used by
+ * the T3 lake bridge, so both services share the principal tables. Keeping the
+ * precedence explicit prevents an accidental test/local override from being
+ * silently ignored.
+ */
+export function resolveAgentPrincipalDatabaseUrl(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  return env.BOTMUX_AGENT_DATABASE_URL?.trim() || env.QRANT_RESEARCH_DATABASE_URL?.trim();
+}
+
+/** Production factory is optional so unit tests can use a tiny fake executor. */
+export function createAgentPrincipalPool(connectionString = resolveAgentPrincipalDatabaseUrl()): SqlPool {
+  if (!connectionString?.trim()) throw new AgentPrincipalLookupError('database_unavailable', 'agent principal database is not configured');
+  const require = createRequire(import.meta.url);
+  let pg: any;
+  try { pg = require('pg'); } catch { throw new AgentPrincipalLookupError('database_unavailable', 'the pg package is not installed'); }
+  return new pg.Pool({ connectionString, max: 4, idleTimeoutMillis: 30_000, connectionTimeoutMillis: 5_000 }) as SqlPool;
+}

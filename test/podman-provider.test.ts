@@ -33,6 +33,7 @@ function makeFixture() {
   const dataRoot = join(sourceRepo, 'apps', 'quant-qlib', 'data');
   const knowledgeRoot = join(sourceRepo, 'apps', 'quant-qlib', 'knowledge', 'investment-books');
   mkdirSync(dataRoot, { recursive: true });
+  mkdirSync(join(dataRoot, 'staging'), { recursive: true });
   mkdirSync(knowledgeRoot, { recursive: true });
   writeFileSync(join(dataRoot, 'tracked-catalog.txt'), 'mounted data\n');
   writeFileSync(join(knowledgeRoot, 'tracked-book.txt'), 'mounted book\n');
@@ -111,6 +112,7 @@ describe('PodmanExecutionProvider', () => {
     expect(calls.filter(call => call[0] === 'git' && call[1] === 'clone')).toHaveLength(1);
     expect(statSync(first.runtime.sessionRoot).mode & 0o777).toBe(0o700);
     expect(statSync(first.runtime.homeRoot).mode & 0o777).toBe(0o700);
+    expect(statSync(first.runtime.stagingRoot).mode & 0o777).toBe(0o700);
     expect(existsSync(join(first.hostWorkingDir, '.git'))).toBe(true);
     expect(readlinkSync(join(first.hostWorkingDir, 'apps/quant-qlib/data'))).toBe('/shared/quant-data');
     expect(readlinkSync(join(first.hostWorkingDir, 'apps/quant-qlib/knowledge/investment-books')))
@@ -125,6 +127,11 @@ describe('PodmanExecutionProvider', () => {
       checkImage: false,
       hostUid: 1000,
       hostGid: 104,
+      hostEnv: {
+        PATH: '/usr/bin',
+        HOME: '/home/admin',
+        OPENAI_API_KEY: 'host-secret-must-not-forward',
+      },
     });
     const prepared = await provider.prepare({
       sessionId: 'session-api',
@@ -158,12 +165,14 @@ describe('PodmanExecutionProvider', () => {
     expect(argv).toContain('--add-host=host.containers.internal:127.0.0.1');
     expect(argv).toContain('--add-host=host.docker.internal:127.0.0.1');
     expect(argv).toContain('dst=/shared/quant-data,ro');
+    expect(argv).toContain(`src=${prepared.runtime.stagingRoot},dst=/shared/quant-data/staging,rw`);
     expect(argv).toContain('dst=/knowledge/investment-books,ro');
     expect(argv).toContain('dst=/session/outbox,rw');
     expect(argv).toContain('--env=AGENT_API_KEY');
     expect(argv).toContain('--env=BOTMUX_SESSION_ID=session-api');
     expect(argv).toContain('--env=BOTMUX_CHAT_ID=oc_chat_test');
     expect(launch.env.AGENT_API_KEY).toBe('secret-do-not-log');
+    expect(launch.env.OPENAI_API_KEY).toBeUndefined();
     expect(readFileSync(prepared.credential.providerConfig!.path, 'utf8')).not.toContain('secret-do-not-log');
     expect(launch.transcriptPaths).toEqual({
       hostSessionHome: prepared.runtime.homeRoot,
@@ -173,6 +182,13 @@ describe('PodmanExecutionProvider', () => {
       hostWorkspaceRoot: prepared.runtime.workspaceRoot,
       containerWorkspaceRoot: '/workspace',
     });
+    expect(() => provider.launch(prepared, {
+      cliId: 'opencode',
+      bin: 'opencode',
+      args: ['--version'],
+      credentialSecret: 'secret-do-not-log',
+      runtimeEnv: { LD_PRELOAD: '/tmp/host-hook.so' },
+    })).toThrow(/not allow-listed/);
   });
 
   it('fails closed without frozen bindings and never falls back to a host CLI', async () => {
@@ -191,6 +207,45 @@ describe('PodmanExecutionProvider', () => {
       .toThrow(/cliId mismatch/);
     expect(() => provider.launch(prepared, { cliId: 'codex', bin: 'sh', args: [] }))
       .toThrow(/fixed codex/);
+  });
+
+  it('launches Codex API credentials without provisioning or requiring auth.json', async () => {
+    const fixture = makeFixture();
+    const provider = new PodmanExecutionProvider(fixture.config, {
+      commandRunner: fakeRunner([]),
+      checkImage: false,
+      hostUid: 1000,
+      hostGid: 104,
+    });
+    const prepared = await provider.prepare({
+      sessionId: 'codex-api',
+      cliId: 'codex',
+      principalBinding: { larkAppId: 'cli_test', openId: 'ou_test' },
+      credentialBinding: {
+        kind: 'api',
+        version: 1,
+        baseUrl: 'https://api.example.com/v1',
+        model: 'codex-api-test',
+      },
+    });
+    expect(existsSync(prepared.runtime.codexAuthPath)).toBe(false);
+    expect(prepared.credential.credentialKind).toBe('api');
+    const launch = provider.launch(prepared, {
+      cliId: 'codex',
+      bin: 'codex',
+      args: ['--version'],
+      credentialSecret: 'codex-api-secret',
+    });
+    expect(launch.env.OPENAI_API_KEY).toBe('codex-api-secret');
+    expect(launch.args).toContain('--env=OPENAI_BASE_URL=https://api.example.com/v1');
+    expect(launch.args).toContain('--env=OPENAI_MODEL=codex-api-test');
+    const codexConfig = readFileSync(join(prepared.runtime.homeRoot, '.codex', 'config.toml'), 'utf8');
+    expect(codexConfig).toContain('model_provider = "botmux_api"');
+    expect(codexConfig).toContain('base_url = "https://api.example.com/v1"');
+    expect(codexConfig).toContain('env_key = "OPENAI_API_KEY"');
+    expect(codexConfig).toContain('wire_api = "responses"');
+    expect(codexConfig).not.toContain('codex-api-secret');
+    expect(existsSync(prepared.runtime.codexAuthPath)).toBe(false);
   });
 
  it('stops without deleting runtime and gates destructive deletion', async () => {

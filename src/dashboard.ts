@@ -169,7 +169,7 @@ import {
   enrichPacksForDashboard,
   sanitizeSkillForDashboard,
 } from './dashboard/skill-pack-response.js';
-import { effectiveDefaultWorkingDir, getBot, loadBotConfigs, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
+import { effectiveDefaultWorkingDir, getBot, registerBot, loadBotConfigs, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
 import { addChatToFeedGroup, createFeedGroup, FEED_GROUP_SCOPES, FeedGroupApiError, listFeedGroups } from './dashboard/feed-groups.js';
 import { generateAuthUrl, handleCallbackUrl, isCallbackUrl } from './utils/user-token.js';
 import { findEntryIndex, readRawConfig, requireConfigPath, writeRawConfigAtomic } from './services/config-store.js';
@@ -242,6 +242,28 @@ import {
 } from './dashboard/dashboard-summary.js';
 import { createDashboardSummaryEndpoint } from './dashboard/dashboard-summary-endpoint.js';
 import { scrubWorkflowWorkerEnv } from './utils/child-env.js';
+import {
+  consumePairing,
+  createAgentPairingSession,
+  createPairing,
+  getAgentPairingSession,
+  getPairingStatus,
+  PairingCapacityError,
+  revokeAgentPairingSession,
+} from './services/pairing-store.js';
+import {
+  agentPairingRateLimiter,
+  pairingClientAddress,
+  pairingRateLimitRoute,
+} from './services/agent-pairing-rate-limit.js';
+import { getDeploymentIdentity } from './services/deployment-identity.js';
+import { AgentPrincipalRepository, createAgentPrincipalPool, type AgentPrincipalKey } from './services/agent-principal-store.js';
+import { loadCredentialMasterKey } from './services/agent-principal-crypto.js';
+import { PodmanCodexDeviceAuthRunner, CodexDeviceLoginService } from './services/codex-device-login.js';
+import { principalHash, parsePodmanExecutionConfig } from './execution/podman-execution.js';
+import { handleAgentCredentialsApi } from './dashboard/agent-credentials-api.js';
+import { probePodmanApiCredential } from './services/agent-credential-probe.js';
+import { sendUserMessage } from './im/lark/client.js';
 
 // The dashboard is an independent long-lived PM2 app and can be resurrected
 // from a stale dump.pm2 without passing through cli.ts pm2Env(). Its start/stop
@@ -262,6 +284,7 @@ const REGISTRY_DIR = join(resolveBotmuxDataDir(), 'dashboard-daemons');
 // the `botmux dashboard` CLI can reach /__cli/current, /__cli/ensure, and
 // /__cli/rotate without guessing.
 const PORT_PATH = join(homedir(), '.botmux', '.dashboard-port');
+const MAX_LIVE_AGENT_PAIRINGS = 128;
 
 function loadOrCreateSecret(): string {
   let existing: string | null;
@@ -2779,6 +2802,265 @@ function analyticsService(): FeedbackAnalyticsService {
   return feedbackAnalyticsService ??= new FeedbackAnalyticsService(config.session.dataDir);
 }
 
+type PrincipalBrowserIdentity = {
+  readonly key: AgentPrincipalKey;
+  readonly unionId?: string;
+  readonly name?: string;
+  readonly sessionToken: string;
+  readonly expiresAt: number;
+};
+
+function principalBrowserIdentity(req: IncomingMessage): PrincipalBrowserIdentity | undefined {
+  const header = req.headers.cookie;
+  let value: string | undefined;
+  if (header) {
+    for (const part of header.split(';')) {
+      const trimmed = part.trim();
+      if (trimmed.startsWith('botmux_agent_session=')) {
+        value = trimmed.slice('botmux_agent_session='.length);
+        break;
+      }
+    }
+  }
+  // The API also accepts the pairing bearer directly for non-browser clients.
+  // If a stale cookie is present, still allow a valid explicit bearer to take
+  // precedence rather than turning the stale cookie into a hard failure.
+  const auth = req.headers.authorization;
+  const bearer = auth?.startsWith('Bearer ') ? auth.slice('Bearer '.length).trim() : undefined;
+  const candidateValues = [value, bearer].filter((candidate): candidate is string => !!candidate);
+  for (const candidate of candidateValues) {
+    const session = getAgentPairingSession(config.session.dataDir, candidate);
+    const claimer = session?.principal;
+    if (!session || !claimer?.larkAppId || !claimer.openId) continue;
+    return {
+      key: { larkAppId: claimer.larkAppId, openId: claimer.openId },
+      ...(claimer.unionId ? { unionId: claimer.unionId } : {}),
+      ...(claimer.name ? { name: claimer.name } : {}),
+      sessionToken: session.sessionToken,
+      expiresAt: session.expiresAt,
+    };
+  }
+  return undefined;
+}
+
+let agentPrincipalRepository: AgentPrincipalRepository | undefined;
+function getAgentPrincipalRepository(): AgentPrincipalRepository {
+  if (agentPrincipalRepository) return agentPrincipalRepository;
+  agentPrincipalRepository = new AgentPrincipalRepository(
+    createAgentPrincipalPool(),
+    loadCredentialMasterKey(),
+  );
+  return agentPrincipalRepository;
+}
+
+async function stopPrincipalSessionsFromDashboard(key: AgentPrincipalKey): Promise<void> {
+  const upstream = await proxyToDaemon(key.larkAppId, '/api/agent/principal/stop', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(key),
+  });
+  if (!upstream.ok) throw new Error('principal_session_stop_failed');
+}
+
+const codexLoginServices = new Map<string, CodexDeviceLoginService>();
+function getCodexLoginService(key: AgentPrincipalKey): CodexDeviceLoginService {
+  const existing = codexLoginServices.get(key.larkAppId);
+  if (existing) return existing;
+  let bot: BotConfig;
+  try {
+    bot = getBot(key.larkAppId).config;
+  } catch {
+    bot = loadBotConfigs().find(candidate => candidate.larkAppId === key.larkAppId)!;
+    if (!bot) throw new Error('codex_bot_not_found');
+    try { registerBot(bot); } catch { /* another dashboard task registered it */ }
+  }
+  if (!bot.execution || bot.execution.type !== 'podman') throw new Error('codex_device_auth_requires_podman_bot');
+  const execution = parsePodmanExecutionConfig(bot.execution);
+  const repository = getAgentPrincipalRepository();
+  const authRoot = execution.credentialCacheRoot;
+  const runner = new PodmanCodexDeviceAuthRunner({ image: execution.image, authRoot });
+  const service = new CodexDeviceLoginService({
+    repository,
+    runner,
+    authPathFor: (principal, taskId) => join(authRoot, principalHash(principal), 'device-auth', taskId, 'auth.json'),
+    canonicalAuthPathFor: principal => join(authRoot, principalHash(principal), 'codex', 'auth.json'),
+    stopSessionsForPrincipal: stopPrincipalSessionsFromDashboard,
+    notifyDeviceChallenge: async (principal, challenge) => {
+      await sendUserMessage(
+        principal.larkAppId,
+        principal.openId,
+        `Codex 登录：请打开 ${challenge.verificationUri}，输入设备码 ${challenge.userCode}。此设备码将在 5 分钟后失效。`,
+        'text',
+      );
+    },
+  });
+  codexLoginServices.set(key.larkAppId, service);
+  return service;
+}
+
+function agentCookieSecure(req: IncomingMessage): boolean {
+  if ((req.socket as { encrypted?: boolean } | undefined)?.encrypted) return true;
+  const forwarded = String(req.headers['x-forwarded-proto'] ?? '').split(',')[0]?.trim().toLowerCase();
+  return forwarded === 'https';
+}
+
+function agentSessionCookie(req: IncomingMessage, token: string, maxAgeSeconds: number): string {
+  return `botmux_agent_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}${agentCookieSecure(req) ? '; Secure' : ''}`;
+}
+
+function agentPairingPage(): string {
+  // This page deliberately exposes only a browser bearer and the short pairing
+  // code. It never renders the app/open_id or any credential secret.
+  return `<!doctype html><meta charset="utf-8"><title>Botmux credentials</title>
+<style>body{font:15px system-ui,sans-serif;max-width:620px;margin:40px auto;padding:0 20px}label{display:block;margin:12px 0 4px}input{box-sizing:border-box;width:100%;padding:8px}button{margin:12px 8px 0 0;padding:8px 12px}#pair{font-size:28px;letter-spacing:3px}#state{white-space:pre-wrap;color:#555}</style>
+<h1>Botmux</h1><p id="state">正在创建配对…</p><div id="pair"></div>
+<section id="form" hidden><div id="identity"></div><label>API key<input id="key" type="password" autocomplete="off"></label><label>Base URL<input id="base" type="url" placeholder="https://api.example.com"></label><label>Model<input id="model" autocomplete="off"></label><button id="save">保存 API 凭据</button><button id="remove">删除 API 凭据</button><hr><button id="codexBegin">开始 Codex 登录</button><button id="codexComplete">完成 Codex 登录</button><button id="codexStatus">刷新 Codex 状态</button><button id="codexLogout">退出 Codex</button><button id="revoke">退出此浏览器</button><div id="cred"></div></section>
+<script>
+(()=>{const state=document.querySelector('#state'),pair=document.querySelector('#pair'),form=document.querySelector('#form'),cred=document.querySelector('#cred'),identity=document.querySelector('#identity');let p,codexTaskId,credentialVersion=0,codexExpectedVersion=0;
+const json=async(u,o)=>{const r=await fetch(u,{headers:{'content-type':'application/json'},...o});const j=await r.json().catch(()=>({ok:false,error:'bad_response'}));if(!r.ok)throw new Error(j.error||'request_failed');return j};
+const show=()=>{form.hidden=false;Promise.all([json('/api/agent/principal'),json('/api/agent/model-credential')]).then(([who,j])=>{const p=who.principal||{};identity.textContent='固定 harness：'+(p.harness||'unknown')+'；当前身份：'+(p.larkAppId||'')+' / '+(p.openId||'');const codex=p.harness==='codex';['codexBegin','codexComplete','codexStatus','codexLogout'].forEach(id=>{document.querySelector('#'+id).hidden=!codex});credentialVersion=j.credential?.credentialVersion||0;cred.textContent=j.credential?('已配置 '+(j.credential.model||'')+'，版本 '+credentialVersion):'尚未配置 API 凭据'}).catch(e=>{cred.textContent=e.message})};
+const conflict=e=>{cred.textContent=e.message==='credential_version_conflict'?'凭据已被其他会话修改，请刷新后重试':e.message;if(e.message==='credential_version_conflict')show()};
+const consume=async()=>{const j=await json('/api/agent/pairing/consume',{method:'POST',body:JSON.stringify({pairingId:p.pairingId,browserToken:p.browserToken})});state.textContent='已连接';pair.textContent='';show();return j};
+const poll=async()=>{try{const j=await json('/api/agent/pairing/status',{method:'POST',body:JSON.stringify({pairingId:p.pairingId,browserToken:p.browserToken})});if(j.status==='claimed')return consume();if(j.status==='pending')return setTimeout(poll,2000);state.textContent='配对已过期，请刷新页面';}catch(e){state.textContent=e.message}};
+const suppliedHash=location.hash.startsWith('#')?location.hash.slice(1):'',supplied=new URLSearchParams(suppliedHash),suppliedPairingId=supplied.get('pairingId'),suppliedBrowserToken=supplied.get('browserToken');
+if(suppliedPairingId&&suppliedBrowserToken) history.replaceState(null,'',location.pathname+location.search);
+(suppliedPairingId&&suppliedBrowserToken?Promise.resolve({pairingId:suppliedPairingId,browserToken:suppliedBrowserToken,code:supplied.get('code')||''}):json('/api/agent/pairing/start',{method:'POST'})).then(j=>{p=j;pair.textContent=j.code?('/pair '+j.code):'';state.textContent='请在对应 Bot 中发送以下命令';poll()}).catch(e=>state.textContent=e.message);
+document.querySelector('#save').onclick=async()=>{try{const j=await json('/api/agent/model-credential',{method:'PUT',body:JSON.stringify({key:document.querySelector('#key').value,baseUrl:document.querySelector('#base').value,model:document.querySelector('#model').value,expectedVersion:credentialVersion})});document.querySelector('#key').value='';credentialVersion=j.credential.credentialVersion;cred.textContent='已保存，版本 '+credentialVersion}catch(e){conflict(e)}};
+document.querySelector('#remove').onclick=async()=>{try{await json('/api/agent/model-credential',{method:'DELETE',body:JSON.stringify({expectedVersion:credentialVersion})});credentialVersion=0;cred.textContent='已删除'}catch(e){conflict(e)}};
+document.querySelector('#codexBegin').onclick=async()=>{try{const current=await json('/api/agent/model-credential');codexExpectedVersion=current.credential?.credentialVersion||0;const j=await json('/api/agent/model-login',{method:'POST',body:JSON.stringify({action:'begin'})});codexTaskId=j.task.taskId;cred.textContent='打开 '+j.task.verificationUri+' 并输入 '+j.task.userCode}catch(e){conflict(e)}};
+document.querySelector('#codexComplete').onclick=async()=>{try{if(!codexTaskId)throw new Error('请先开始 Codex 登录');const j=await json('/api/agent/model-login',{method:'POST',body:JSON.stringify({action:'complete',taskId:codexTaskId,expectedVersion:codexExpectedVersion})});codexTaskId=undefined;credentialVersion=j.credential.credentialVersion;cred.textContent='Codex 已登录，凭据版本 '+credentialVersion}catch(e){conflict(e)}};
+document.querySelector('#codexStatus').onclick=async()=>{try{const j=await json('/api/agent/model-login',{method:'POST',body:JSON.stringify({action:'status'})});cred.textContent='Codex 状态：'+j.task.status}catch(e){cred.textContent=e.message}};
+document.querySelector('#codexLogout').onclick=async()=>{try{await json('/api/agent/model-login',{method:'POST',body:JSON.stringify({action:'logout'})});cred.textContent='Codex 已退出'}catch(e){cred.textContent=e.message}};
+document.querySelector('#revoke').onclick=async()=>{try{await json('/api/agent/pairing/revoke',{method:'POST',body:'{}'});location.reload()}catch(e){cred.textContent=e.message}};
+})();
+</script>`;
+}
+
+async function handleAgentPairingRoute(req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> {
+  if (req.method === 'GET' && (url.pathname === '/agent' || url.pathname === '/agent/credentials')) {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+    res.end(agentPairingPage());
+    return true;
+  }
+  if (!url.pathname.startsWith('/api/agent/pairing/')) return false;
+  const rateLimitRoute = pairingRateLimitRoute(url.pathname);
+  if (rateLimitRoute) {
+    const decision = agentPairingRateLimiter.check(pairingClientAddress(req), rateLimitRoute);
+    if (!decision.allowed) {
+      jsonRes(res, 429, { ok: false, error: 'rate_limited' }, {
+        'retry-after': String(decision.retryAfterSeconds),
+      });
+      return true;
+    }
+  }
+  let body: any = {};
+  if (req.method !== 'GET') {
+    try { body = await readJsonBody(req); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
+  }
+  const dataDir = config.session.dataDir;
+  try {
+    if (url.pathname === '/api/agent/pairing/start' && req.method === 'POST') {
+      // Capacity is checked while holding the pairing-store lock, so two
+      // dashboard processes cannot both observe the last available slot.
+      const p = createPairing(dataDir, undefined, undefined, MAX_LIVE_AGENT_PAIRINGS);
+      jsonRes(res, 200, { ok: true, pairingId: p.pairingId, code: p.code, browserToken: p.browserToken, expiresAt: p.expiresAt });
+      return true;
+    }
+    if (url.pathname === '/api/agent/pairing/status' && req.method === 'POST') {
+      const view = getPairingStatus(dataDir, String(body?.pairingId ?? ''), String(body?.browserToken ?? ''));
+      jsonRes(res, 200, {
+        ok: true,
+        status: view.status,
+        ...(view.status === 'claimed' && view.claimedBy.name ? { name: view.claimedBy.name } : {}),
+      });
+      return true;
+    }
+    if (url.pathname === '/api/agent/pairing/consume' && req.method === 'POST') {
+      const pairingId = String(body?.pairingId ?? '');
+      const browserToken = String(body?.browserToken ?? '');
+      const consumed = consumePairing(dataDir, pairingId, browserToken);
+      if (!consumed.ok) { jsonRes(res, 409, { ok: false, error: consumed.reason }); return true; }
+      if (!consumed.claimedBy.larkAppId || !consumed.claimedBy.openId) {
+        jsonRes(res, 403, { ok: false, error: 'pairing_not_app_scoped' });
+        return true;
+      }
+      const session = createAgentPairingSession(dataDir, consumed.claimedBy);
+      jsonRes(res, 200, {
+        ok: true,
+        status: 'consumed',
+        // The browser also receives an HttpOnly cookie. Returning the same
+        // short-lived bearer lets non-browser clients use Authorization
+        // without weakening the independent dashboard-auth boundary.
+        sessionToken: session.sessionToken,
+        expiresAt: session.expiresAt,
+        ...(consumed.claimedBy.name ? { name: consumed.claimedBy.name } : {}),
+      }, { 'set-cookie': agentSessionCookie(req, session.sessionToken, Math.max(1, Math.floor((session.expiresAt - Date.now()) / 1000))) });
+      return true;
+    }
+    if (url.pathname === '/api/agent/pairing/revoke' && req.method === 'POST') {
+      const identity = principalBrowserIdentity(req);
+      if (!identity) { jsonRes(res, 401, { ok: false, error: 'pairing_required' }); return true; }
+      revokeAgentPairingSession(dataDir, identity.sessionToken);
+      jsonRes(res, 200, { ok: true }, { 'set-cookie': agentSessionCookie(req, '', 0) });
+      return true;
+    }
+    jsonRes(res, 404, { ok: false, error: 'not_found' });
+    return true;
+  } catch (error) {
+    if (error instanceof PairingCapacityError) {
+      jsonRes(res, 429, { ok: false, error: 'pairing_capacity' }, { 'retry-after': '30' });
+      return true;
+    }
+    jsonRes(res, 503, { ok: false, error: 'pairing_service_unavailable' });
+    return true;
+  }
+}
+
+async function handleAgentCredentialsRoute(req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> {
+  if (!url.pathname.startsWith('/api/agent/')) return false;
+  const identity = principalBrowserIdentity(req);
+  if (!identity) {
+    jsonRes(res, 401, { ok: false, error: 'pairing_required' });
+    return true;
+  }
+  let body: unknown = {};
+  if (req.method !== 'GET') {
+    try { body = await readJsonBody(req); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
+  }
+  const bot = (() => {
+    try { return getBot(identity.key.larkAppId).config; } catch { return loadBotConfigs().find(candidate => candidate.larkAppId === identity.key.larkAppId); }
+  })();
+  const probeApiCredential = bot?.execution?.type === 'podman'
+    ? async (input: { readonly cliId: string; readonly apiKey: string; readonly baseUrl: string; readonly model: string }): Promise<void> => {
+      const execution = parsePodmanExecutionConfig(bot.execution);
+      await probePodmanApiCredential({ execution, ...input });
+    }
+    : undefined;
+  let result;
+  try {
+    result = await handleAgentCredentialsApi({
+      method: (req.method ?? 'GET') as 'GET' | 'PUT' | 'PATCH' | 'DELETE' | 'POST',
+      path: url.pathname,
+      body,
+      principal: identity.key,
+      chatType: 'p2p',
+      botCliId: bot?.cliId,
+    }, {
+      repository: getAgentPrincipalRepository(),
+      stopSessionsForPrincipal: stopPrincipalSessionsFromDashboard,
+      loginService: url.pathname === '/api/agent/model-login' ? getCodexLoginService(identity.key) : undefined,
+      probeApiCredential,
+    });
+  } catch {
+    // DB/master-key/config failures are deliberately indistinguishable at the
+    // HTTP boundary and never include DSNs, paths, or credential text.
+    jsonRes(res, 503, { ok: false, error: 'credential_service_unavailable' });
+    return true;
+  }
+  jsonRes(res, result.status, result.body);
+  return true;
+}
+
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
@@ -2938,6 +3220,12 @@ const server = createServer(async (req, res) => {
       startPlatformTunnelIfBound();
       return jsonRes(res, 200, { ok: true });
     }
+
+    // BYOK pairing and its narrow self-service API intentionally sit outside
+    // the dashboard management-token gate. The handler itself accepts only a
+    // separate pairing session bearer and never upgrades it to dashboard auth.
+    if (await handleAgentPairingRoute(req, res, url)) return;
+    if (await handleAgentCredentialsRoute(req, res, url)) return;
 
     const activeToken = currentDashboardToken();
     const presentedToken = authedToken(req, url, activeToken);

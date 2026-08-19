@@ -94,6 +94,7 @@ import { validateWorkingDir } from '../../core/working-dir.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
 import { activeSessionKey, sessionKey, sessionAnchorId, frozenDisplayMode, markRepoCardConsumed, isActiveRepoCard } from '../../core/types.js';
 import type { DaemonSession } from '../../core/types.js';
+import { ensureSandboxPrincipalForFork } from '../../core/agent-principal-runtime.js';
 import { buildTerminalUrl } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
@@ -584,6 +585,12 @@ export async function commitRepoSelection(
       // forkWorker's synchronous pre-accept/write-ahead phase. If it throws,
       // the user can retry this exact selection without losing the first turn.
       const pendingTurnId = ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId;
+      await ensureSandboxPrincipalForFork({
+        ds,
+        execution: getBot(ds.larkAppId).config.execution,
+        cliId: getBot(ds.larkAppId).config.cliId,
+        persist: session => sessionStore.updateSession(session),
+      });
       forkWorker(
         ds,
         prompt,
@@ -751,6 +758,12 @@ export async function commitRepoSelection(
         current.lastScreenContent = undefined;
         current.lastScreenStatus = undefined;
         activeSessions.set(key, current);
+        await ensureSandboxPrincipalForFork({
+          ds: current,
+          execution: getBot(current.larkAppId).config.execution,
+          cliId: getBot(current.larkAppId).config.cliId,
+          persist: session => sessionStore.updateSession(session),
+        });
         forkWorker(current, '', false);
         // Brand-new CLI in a brand-new session record: the next real business
         // message is its new-topic first turn (same invariant as the pending path).
@@ -2276,6 +2289,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       try {
         if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, voiceInput);
         else {
+          await ensureSandboxPrincipalForFork({
+            ds,
+            execution: getBot(ds.larkAppId).config.execution,
+            cliId: getBot(ds.larkAppId).config.cliId,
+            persist: session => sessionStore.updateSession(session),
+          });
           forkWorker(ds, voiceInput, ds.hasHistory);
           accepted = true;
         }
@@ -2503,6 +2522,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       try {
         if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput);
         else {
+          await ensureSandboxPrincipalForFork({
+            ds,
+            execution: getBot(ds.larkAppId).config.execution,
+            cliId: getBot(ds.larkAppId).config.cliId,
+            persist: session => sessionStore.updateSession(session),
+          });
           forkWorker(ds, retryInput, ds.hasHistory);
           accepted = true;
         }

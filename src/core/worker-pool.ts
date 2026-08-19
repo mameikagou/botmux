@@ -72,6 +72,7 @@ import { RestartCoordinator, type RestartObserver } from './restart-coordinator.
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from '../services/feedback-policy-resolver.js';
+import { assertPodmanPrincipalReadyForFork } from './agent-principal-runtime.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
  *  isolated persistent panes so a suspend→resume reattach (same id) is
@@ -2503,7 +2504,7 @@ export function requestSessionRestart(
     logger.warn(`[${tag(ds)}] Restart refused while routing transfer is in progress`);
     return undefined;
   }
-  return restartCoordinator.request(ds.session.sessionId, observer, attemptId => {
+  return restartCoordinator.request(ds.session.sessionId, observer, async attemptId => {
     if (ds.worker && !ds.worker.killed) {
       ds.workerReady = false;
       ds.worker.send({ type: 'restart', attemptId, env: latestPerBotEnvForRestart(ds) } as DaemonToWorker);
@@ -2514,6 +2515,14 @@ export function requestSessionRestart(
     // fresh CLI instead of reattaching the old one and falsely reporting a
     // successful restart.
     destroyLivePaneBeforeRestart(ds);
+    const botCfg = getBot(ds.larkAppId).config;
+    const { ensureSandboxPrincipalForFork } = await import('./agent-principal-runtime.js');
+    await ensureSandboxPrincipalForFork({
+      ds,
+      execution: botCfg.execution,
+      cliId: botCfg.cliId,
+      persist: session => sessionStore.updateSession(session),
+    });
     forkWorker(ds, '', {
       resume: ds.hasHistory,
       restartAttemptId: attemptId,
@@ -5015,6 +5024,12 @@ export async function forkSession(
   childSession.workingDir = ds.workingDir ?? ds.session.workingDir;
   childSession.ownerOpenId = ds.session.ownerOpenId;
   childSession.backendType = ds.session.backendType;
+  // A fork is a new topic but keeps the source's already-frozen execution and
+  // non-secret principal posture. The child still rehydrates its transient
+  // credential at cold spawn; never copy the decrypted secret into Session.
+  childSession.execution = ds.session.execution;
+  childSession.principalBinding = ds.session.principalBinding;
+  childSession.credentialBinding = ds.session.credentialBinding;
   // Bot identity on the PERSISTED row. Every other createSession caller sets
   // this immediately after minting (trigger-session / session-manager /
   // card-handler / daemon); the fork child must too. The runtime childDs below
@@ -5114,6 +5129,16 @@ export async function forkSession(
   // codex fork). The SOURCE ds is never touched.
   const fkw = opts?.forkWorkerImpl ?? forkWorker;
   try {
+    if (childSession.execution) {
+      const { ensureSandboxPrincipalForFork } = await import('./agent-principal-runtime.js');
+      const botCfg = getBot(childDs.larkAppId).config;
+      await ensureSandboxPrincipalForFork({
+        ds: childDs,
+        execution: botCfg.execution,
+        cliId: botCfg.cliId,
+        persist: session => sessionStore.updateSession(session),
+      });
+    }
     const initialPrompt = opts?.buildInitialPrompt?.(childSession.sessionId) ?? '';
     if (initialPrompt) {
       rememberLastCliInput(
@@ -6333,6 +6358,13 @@ export function forkWorker(
   // config edit must not move an existing conversation between host and
   // Podman, while a new Podman topic still receives the current profile.
   const podmanExecution = ds.session.execution ?? botCfg.execution;
+  if (podmanExecution) {
+    // All async cold-start call sites hydrate the principal before reaching
+    // this synchronous fork boundary. Keep this invariant here as a final
+    // guard so a future call site cannot launch without an app-scoped binding
+    // or accidentally put ChatGPT auth JSON into IPC.
+    assertPodmanPrincipalReadyForFork({ ds, execution: podmanExecution, cliId: botCfg.cliId });
+  }
   if (!ds.session.execution && botCfg.execution) {
     ds.session.execution = botCfg.execution;
     sessionStore.updateSession(ds.session);
@@ -6378,6 +6410,7 @@ export function forkWorker(
   let worker!: ChildProcess;
   let startupState!: WorkerStartupState;
   let initMsg!: Extract<DaemonToWorker, { type: 'init' }>;
+  let durableInitMsg!: Extract<DaemonToWorker, { type: 'init' }>;
   let agentCfg!: ReturnType<typeof sessionAgentConfig>;
   const t = tag(ds);
   ds.localProcessAttestation = undefined;
@@ -6872,6 +6905,7 @@ export function forkWorker(
     ...(podmanExecution ? { execution: podmanExecution } : {}),
     ...(ds.session.principalBinding ? { principalBinding: ds.session.principalBinding } : {}),
     ...(ds.session.credentialBinding ? { credentialBinding: ds.session.credentialBinding } : {}),
+    ...(podmanExecution && ds.credentialSecret ? { credentialSecret: ds.credentialSecret } : {}),
     riffParentTaskId: ds.session.riffParentTaskId,
     riffRepoDirs: ds.session.riffRepoDirs,
     deferredScheduleRun: ds.session.deferredScheduleRun,
@@ -6952,7 +6986,12 @@ export function forkWorker(
       sessionStore.updateSession(ds.session);
     }
   }
-  ds.initConfig = initMsg;
+  // Keep the durable in-memory launch snapshot free of the transient secret;
+  // the raw init message is sent over IPC below and may remain only in the
+  // short-lived receipt retry record until the worker acknowledges it.
+  const { credentialSecret: _transientCredentialSecret, ...withoutTransientCredential } = initMsg;
+  durableInitMsg = withoutTransientCredential;
+  ds.initConfig = durableInitMsg;
 
   // Stamp cliId on the persisted session so the dashboard can show a CLI badge
   // even after the session is closed. Do this before installing worker handlers:
@@ -6979,11 +7018,17 @@ export function forkWorker(
   setupWorkerHandlers(ds, worker, startupState, workerGeneration);
 
   ds.worker = worker;
+  let initDispatched = false;
   if (shouldTrackOrdinaryImDelivery(ds, initMsg)) {
-    sendOrdinaryImDeliveryTracked(ds, initMsg);
+    initDispatched = sendOrdinaryImDeliveryTracked(ds, initMsg);
   } else {
     worker.send(initMsg);
+    initDispatched = true;
   }
+  // The decrypted API secret is needed only to serialize this init payload. It
+  // must not remain on the long-lived DaemonSession after IPC dispatch; a cold
+  // replacement will explicitly rehydrate a fresh version from PostgreSQL.
+  if (initDispatched) ds.credentialSecret = undefined;
   ds.spawnedAt = Date.now();
   // master: per-runtime-key CLI version (the init send already happened above via
   // the tracked-delivery if/else — do NOT re-send initMsg here).
@@ -6997,6 +7042,10 @@ export function forkWorker(
   // point are safe to compensate; clear the pre-init compensation handle.
   spawnedWorker = undefined;
   } catch (err) {
+    // No child received the init payload on this pre-dispatch path. Discard
+    // the decrypted secret before restoring the durable session state; a
+    // later retry must rehydrate it under the current credential version.
+    ds.credentialSecret = undefined;
     if (ds.worker === spawnedWorker) {
       ds.worker = null;
       ds.workerPort = null;
@@ -7020,7 +7069,7 @@ export function forkWorker(
     }
     throw err;
   }
-  ds.initConfig = initMsg;
+  ds.initConfig = durableInitMsg;
   try {
     sessionStore.updateSessionPid(ds.session.sessionId, worker.pid ?? null);
   } catch (err) {

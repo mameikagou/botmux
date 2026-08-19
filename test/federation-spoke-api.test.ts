@@ -123,6 +123,7 @@ describe('handleFederationSpokeApi', () => {
     res = makeRes();
     await handleFederationSpokeApi(makeReq('POST', '/api/team/identity/consume', { pairingId, browserToken }), res, url('/api/team/identity/consume'), { dataDir });
     expect(res.statusCode).toBe(200);
+    expect(res._headers['set-cookie']).toBeUndefined();
     expect(json(res).owner).toMatchObject({ unionId: 'on_me', name: '示例用户' });
     // deployment owner bound
     expect(getDeploymentIdentity(dataDir).ownerUnionId).toBe('on_me');

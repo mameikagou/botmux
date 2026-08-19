@@ -465,6 +465,9 @@ export async function handleFederationSpokeApi(
     // binding can derive the operator — don't wait for the 2-min periodic sync,
     // otherwise #3 (operator not invited) reproduces.
     const sync = await bindDeploymentOwnerAndClaim(dataDir, owner, { fetcher, live });
+    // Owner binding is a deployment-management action. It must never mint the
+    // independent BYOK pairing-session cookie; friends use /api/agent/pairing/*
+    // and therefore cannot inherit dashboard owner privileges from this route.
     jsonRes(res, 200, { ok: true, owner, hubsSynced: sync.synced, hubsFailed: sync.failed });
     return true;
   }

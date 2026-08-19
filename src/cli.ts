@@ -270,6 +270,7 @@ import {
   resolvePersistentBackendTarget,
   type PersistentBackendType,
 } from './core/persistent-backend.js';
+import { runDataPublishCommand } from './cli/data-publish.js';
 
 // Resolve the CLI's UI locale once from the global config file, so subsequent
 // CLI output (and any t() callers that don't pass an explicit locale) honour
@@ -13214,6 +13215,21 @@ switch (command) {
     break;
   }
   case 'send':     await cmdSend(process.argv.slice(3)); break;
+  case 'data-publish':
+    try { runDataPublishCommand(process.argv.slice(3)); }
+    catch (error) { console.error(`data-publish failed: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 2; }
+    break;
+  case 'agent-principals':
+  case 'principal': {
+    try {
+      const { runAgentPrincipalSeedCommand } = await import('./cli/agent-principals.js');
+      await runAgentPrincipalSeedCommand(process.argv.slice(3));
+    } catch (error) {
+      console.error(`agent-principals failed: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 2;
+    }
+    break;
+  }
   case 'chat':     await cmdChat(process.argv.slice(3)); break;
   case 'dispatch': await cmdDispatch(process.argv.slice(3)); break;
   case 'report': await cmdReport(process.argv.slice(3)); break;

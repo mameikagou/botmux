@@ -641,6 +641,7 @@ export const messages: Record<string, string> = {
   'help.heading_login': '🔐 User OAuth:',
   'help.login': '/login              - Lark user OAuth (lets you download images etc. from third-party cards)',
   'help.login_status': '/login status       - Show auth status',
+  'help.model_login': '/model-login codex [begin|status|complete TASK_ID|logout] - Manage Codex ChatGPT login (DM only)',
   'help.pair': '/pair <code>        - Bind a team-platform web login pairing code',
   'help.heading_workflow': '🧭 Workflow:',
   'help.workflow_run': '/workflow <goal>; /workflow run <name> [key=value ...] - Start ad-hoc or run a Saved Workflow',

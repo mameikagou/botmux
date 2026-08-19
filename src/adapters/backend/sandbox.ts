@@ -29,6 +29,7 @@ import {
   MCP_GATEWAY_REQUIRED_ENV,
   MCP_GATEWAY_SOCKET_ENV,
 } from '../../core/plugins/mcp/environment.js';
+import { DataPublishRelay, type DataPublishCapability, type ValidatedDataPublishRequest } from '../../services/agent-data-publish-relay.js';
 
 /** Verify (and best-effort auto-install) bubblewrap so the user needn't
  *  pre-install. Installs via the system package manager when the daemon can
@@ -1055,12 +1056,35 @@ export function startOutboxWatcher(
           };
         }
       | { ok: false; error: string };
+    /** Optional host-side T3 data publication bridge. The callback receives a
+     * path already proven to be inside this session's staging root. */
+    dataPublish?: {
+      sessionStagingRoot: string;
+      /** Host-derived session identity required for rich T3 envelopes. */
+      expectedSessionHash?: string;
+      expectedOwnerOpenIdHash?: string;
+      /** Host-authoritative capability. Never read the child-writable file as
+       * authority: the sandbox can mutate the outbox mount. */
+      capability: () => DataPublishCapability | undefined;
+      onRequest: (request: ValidatedDataPublishRequest) => Promise<void> | void;
+    };
     cliPath?: string;
   } = {},
 ): () => void {
   const cli = opts.cliPath ?? distCliJs();
   const authorize = opts.authorize;
   const inFlight = new Set<string>();
+  const dataPublishRelay = opts.dataPublish
+    ? new DataPublishRelay({
+        outboxRoot: outbox,
+        sessionId,
+        sessionStagingRoot: opts.dataPublish.sessionStagingRoot,
+        expectedSessionHash: opts.dataPublish.expectedSessionHash,
+        expectedOwnerOpenIdHash: opts.dataPublish.expectedOwnerOpenIdHash,
+        capability: opts.dataPublish.capability,
+        onRequest: opts.dataPublish.onRequest,
+      })
+    : undefined;
   // Host-private staging — a sibling of the outbox, NOT bound into the sandbox.
   const staging = join(dirname(outbox), 'relay-staging');
 
@@ -1192,5 +1216,9 @@ export function startOutboxWatcher(
 
   const timer = setInterval(tick, 200);
   timer.unref?.();
-  return () => clearInterval(timer);
+  dataPublishRelay?.start();
+  return () => {
+    clearInterval(timer);
+    dataPublishRelay?.stop();
+  };
 }

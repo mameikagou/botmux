@@ -15,6 +15,7 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   readlinkSync,
   rmSync,
@@ -72,6 +73,11 @@ export interface PrincipalBinding {
   readonly enabled?: boolean;
   readonly canOpenMemory?: boolean;
   readonly can_openmemory?: boolean;
+  /** Non-secret frozen metadata written by the T6 principal boundary. */
+  readonly cliId?: string;
+  readonly credentialKind?: string;
+  readonly credentialVersion?: number;
+  readonly ownerOpenId?: string;
 }
 
 /** Durable, non-secret credential metadata supplied by the future T6 layer. */
@@ -227,10 +233,11 @@ function normalizedMemoryCapability(binding: PrincipalBinding): boolean {
   return camel ?? snake ?? false;
 }
 
-function validatePrincipal(binding: PrincipalBinding | undefined): {
+function validatePrincipal(binding: PrincipalBinding | undefined, cliId?: PodmanCliId): {
   readonly larkAppId: string;
   readonly openId: string;
   readonly canOpenMemory: boolean;
+  readonly ownerOpenId?: string;
 } {
   if (!binding || typeof binding !== 'object') fail('principal binding is required; database lookup is not allowed here');
   if (binding.enabled !== undefined && typeof binding.enabled !== 'boolean') {
@@ -239,7 +246,17 @@ function validatePrincipal(binding: PrincipalBinding | undefined): {
   if (binding.enabled === false) fail('principal binding is disabled');
   const larkAppId = nonEmpty(binding.larkAppId, 'principalBinding.larkAppId');
   const openId = normalizedOpenId(binding);
-  return { larkAppId, openId, canOpenMemory: normalizedMemoryCapability(binding) };
+  if (cliId !== undefined && binding.cliId !== undefined && binding.cliId !== cliId) {
+    fail('principalBinding.cliId does not match the fixed bot harness');
+  }
+  if (binding.credentialVersion !== undefined
+    && (!Number.isSafeInteger(binding.credentialVersion) || binding.credentialVersion <= 0)) {
+    fail('principalBinding.credentialVersion must be a positive integer');
+  }
+  const ownerOpenId = binding.ownerOpenId === undefined
+    ? undefined
+    : nonEmpty(binding.ownerOpenId, 'principalBinding.ownerOpenId');
+  return { larkAppId, openId, canOpenMemory: normalizedMemoryCapability(binding), ...(ownerOpenId ? { ownerOpenId } : {}) };
 }
 
 function validateCredential(binding: CredentialBinding | undefined, cliId: PodmanCliId): CredentialBinding & {
@@ -351,6 +368,22 @@ function requireSourceDirectory(path: string, label: string): void {
       fail(`${label} must be a real directory: ${index === segments.length - 1 ? path : cursor}`);
     }
   }
+}
+
+/** The nested RW bind is a mountpoint, never a fallback data directory. */
+function ensureEmptyStagingMountpoint(path: string, label: string): void {
+  const absolute = resolve(path);
+  let stat: ReturnType<typeof lstatSync>;
+  try {
+    stat = lstatSync(absolute);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    mkdirSync(absolute, { mode: 0o755 });
+    stat = lstatSync(absolute);
+  }
+  if (stat.isSymbolicLink() || !stat.isDirectory()) fail(`${label} must be a real directory mountpoint`);
+  if (readdirSync(absolute).length > 0) fail(`${label} must be empty; it is only a writable mountpoint`);
+  chmodSync(absolute, 0o755);
 }
 
 function requireValidCodexAuthFile(path: string): void {
@@ -496,6 +529,13 @@ const RUNTIME_ENV_KEYS = new Set([
   'BOTMUX_USAGE_DISPLAY',
   'BOTMUX_DAEMON_IPC_PORT',
   'BOTMUX_SESSION_SCOPE',
+  // qlib's filesystem-only submit command needs explicit session envelope
+  // values.  These are hashes/paths/capability values minted by botmux; no
+  // arbitrary host environment is forwarded into the container.
+  'QRANT_SESSION_STAGING_ROOT',
+  'QRANT_SESSION_OUTBOX_DIR',
+  'QRANT_SESSION_HASH',
+  'QRANT_OWNER_OPEN_ID_HASH',
 ]);
 
 /**
@@ -546,16 +586,25 @@ export class PodmanExecutionProvider {
   async prepare(input: PodmanPrepareInput): Promise<PreparedExecution> {
     const sessionId = safeSessionId(input.sessionId);
     const cliId = fixedBotCliId({ cliId: input.cliId });
-    const principal = validatePrincipal(input.principalBinding);
+    const principal = validatePrincipal(input.principalBinding, cliId);
     if (input.expectedLarkAppId !== undefined
       && principal.larkAppId !== nonEmpty(input.expectedLarkAppId, 'expectedLarkAppId')) {
       fail('principal binding belongs to a different larkAppId');
     }
     if (input.expectedOwnerOpenId !== undefined
-      && principal.openId !== nonEmpty(input.expectedOwnerOpenId, 'expectedOwnerOpenId')) {
+      && principal.openId !== nonEmpty(input.expectedOwnerOpenId, 'expectedOwnerOpenId')
+      && principal.ownerOpenId !== nonEmpty(input.expectedOwnerOpenId, 'expectedOwnerOpenId')) {
       fail('principal binding does not match the frozen topic owner');
     }
     const credentialBinding = validateCredential(input.credentialBinding, cliId);
+    if (input.principalBinding?.credentialKind !== undefined
+      && input.principalBinding.credentialKind !== credentialBinding.kind) {
+      fail('principal and credential bindings disagree on credential kind');
+    }
+    if (input.principalBinding?.credentialVersion !== undefined
+      && input.principalBinding.credentialVersion !== credentialBinding.version) {
+      fail('principal and credential bindings disagree on credential version');
+    }
     const runtime = buildSessionRuntimePaths(this.config, principal, sessionId);
     const lockKey = `${this.config.runtimeRoot}/${runtime.principalHash}/${runtime.sessionHash}`;
     const previous = prepareLocks.get(lockKey) ?? Promise.resolve(undefined as unknown as PreparedExecution);
@@ -573,6 +622,10 @@ export class PodmanExecutionProvider {
       const network = buildPastaNetworkPlan(principal.canOpenMemory);
       requireSourceDirectory(this.config.sourceRepo, 'sourceRepo');
       requireSourceDirectory(this.config.dataRoot, 'dataRoot');
+      // Podman must find the nested target before the parent read-only bind is
+      // applied. This empty, real directory is only a mountpoint in the
+      // central tree; all writes go to runtime.stagingRoot below.
+      ensureEmptyStagingMountpoint(join(this.config.dataRoot, 'staging'), 'dataRoot/staging mountpoint');
       requireSourceDirectory(this.config.knowledgeRoot, 'knowledgeRoot');
       if (this.checkImage) {
         await requireCommandSuccess(this.runner, 'podman', ['image', 'exists', this.config.image], { timeoutMs: PODMAN_TIMEOUT_MS });
@@ -586,8 +639,12 @@ export class PodmanExecutionProvider {
       // The leaf auth bind is applied after the home bind. Podman requires the
       // destination parent to exist in the home source, otherwise it cannot
       // resolve /home/dev/.codex/auth.json once /home/dev is over-mounted.
-      if (credential.credentialKind === 'codex_chatgpt') ensureDirectory(join(runtime.homeRoot, '.codex'));
+      if (cliId === 'codex') ensureDirectory(join(runtime.homeRoot, '.codex'));
       ensureDirectory(runtime.outboxRoot);
+      // qlib/data is linked to the read-only central lake. Keep session
+      // staging outside dataRoot and overlay only this leaf as a writable
+      // nested bind at /shared/quant-data/staging.
+      ensureDirectory(runtime.stagingRoot);
       ensureDirectory(runtime.runtimeStateRoot);
       ensureDirectory(runtime.credentialCacheRoot);
       ensureDirectory(runtime.codexCredentialRoot);
@@ -783,6 +840,10 @@ export class PodmanExecutionProvider {
       AGENT_DATA_ROOT: CONTAINER_DATA_ROOT,
       AGENT_KNOWLEDGE_ROOT: CONTAINER_KNOWLEDGE_ROOT,
       AGENT_OUTBOX_ROOT: CONTAINER_OUTBOX_ROOT,
+      // Data publish requests carry only a path relative to this per-session
+      // staging root. The host relay derives the matching host path from the
+      // same runtime workspace; no absolute host path crosses the boundary.
+      BOTMUX_DATA_STAGING_ROOT: '/workspace/analyze/apps/quant-qlib/data/staging',
       BOTMUX_SEND_RELAY: CONTAINER_OUTBOX_ROOT,
       ...runtimeEnvironment,
       ...credentialEnvironment,
@@ -933,12 +994,24 @@ export class PodmanExecutionProvider {
 function ensureProviderConfig(path: string, plan: NonNullable<CredentialInjectionPlan['providerConfig']>): void {
   const parsed = resolve(path);
   ensureDirectory(dirname(parsed));
-  const body = JSON.stringify({
-    cliId: plan.cliId,
-    credentialKind: plan.credentialKind,
-    baseUrl: plan.baseUrl,
-    model: plan.model,
-  }, (_key, value) => value === undefined ? undefined : value) + '\n';
+  const body = plan.format === 'codex-toml'
+    ? [
+        'model_provider = "botmux_api"',
+        `model = ${JSON.stringify(plan.model)}`,
+        '',
+        '[model_providers.botmux_api]',
+        'name = "botmux_api"',
+        `base_url = ${JSON.stringify(plan.baseUrl)}`,
+        `env_key = ${JSON.stringify(plan.secretEnvVar)}`,
+        'wire_api = "responses"',
+        '',
+      ].join('\n')
+    : JSON.stringify({
+        cliId: plan.cliId,
+        credentialKind: plan.credentialKind,
+        baseUrl: plan.baseUrl,
+        model: plan.model,
+      }, (_key, value) => value === undefined ? undefined : value) + '\n';
   // The provider config is a non-secret hint. Refuse a symlink and overwrite
   // only this provider-owned leaf, never an arbitrary file from a binding.
   if (existsSync(parsed)) {

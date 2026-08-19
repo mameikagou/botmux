@@ -4,6 +4,7 @@
  */
 import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve, basename } from 'node:path';
+import { homedir } from 'node:os';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
@@ -22,7 +23,8 @@ import type { CliId, ResumableSession } from '../adapters/cli/types.js';
 import { resolveCliRuntime, runtimeInstallationKey } from '../adapters/cli/runtime.js';
 import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, getMessageThreadId, uploadFile, UserTokenMissingError } from '../im/lark/client.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
-import { claimPairing } from '../services/pairing-store.js';
+import { claimPairing, createPairing, type StartedPairing } from '../services/pairing-store.js';
+import { buildDashboardUrl } from './dashboard-url.js';
 import { logger } from '../utils/logger.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
 import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, requestSessionRestart, isSessionTransferring, type WorkerSessionReplyOptions } from './worker-pool.js';
@@ -97,6 +99,14 @@ import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
+import { ensureSandboxPrincipalForFork } from './agent-principal-runtime.js';
+import { AgentPrincipalRepository, createAgentPrincipalPool, type AgentPrincipalKey } from '../services/agent-principal-store.js';
+import { loadCredentialMasterKey } from '../services/agent-principal-crypto.js';
+import {
+  CodexDeviceLoginService,
+  PodmanCodexDeviceAuthRunner,
+} from '../services/codex-device-login.js';
+import { parsePodmanExecutionConfig, principalHash } from '../execution/podman-execution.js';
 import {
   configuredRuntimeDisplayName,
   sessionConfiguredRuntimeDisplayName,
@@ -120,7 +130,30 @@ export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
  * card buttons routable, but for these that record is a phantom conversation
  * that pollutes the dashboard's session list. Handle them without a session.
  */
-export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/skills', '/vc-auth', '/watch-comment', '/issue']);
+export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/skills', '/vc-auth', '/watch-comment', '/issue', '/model-login']);
+
+/** Create a token-free dashboard URL carrying only a short-lived pairing bearer. */
+export function buildAgentCredentialsPairingUrl(
+  origin: string,
+  pairing: Pick<StartedPairing, 'pairingId' | 'browserToken'>,
+): string {
+  return `${origin.replace(/\/$/u, '')}/agent/credentials#pairingId=${encodeURIComponent(pairing.pairingId)}&browserToken=${encodeURIComponent(pairing.browserToken)}`;
+}
+
+export function createAgentCredentialsPairingLink(dataDir = config.session.dataDir): StartedPairing & { readonly url: string } {
+  const pairing = createPairing(dataDir);
+  let port = config.dashboard.port;
+  try {
+    const parsed = Number.parseInt(readFileSync(join(homedir(), '.botmux', '.dashboard-port'), 'utf8').trim(), 10);
+    if (Number.isSafeInteger(parsed) && parsed > 0 && parsed < 65_536) port = parsed;
+  } catch { /* dashboard may not have persisted its bound port yet */ }
+  const origin = buildDashboardUrl({ host: config.dashboard.externalHost, port });
+  // Keep the one-time bearer out of HTTP request URLs, proxy logs, and server
+  // access logs. The credentials page consumes and immediately clears this
+  // fragment before making any API request.
+  const url = buildAgentCredentialsPairingUrl(origin, pairing);
+  return { ...pairing, url };
+}
 
 const SLASH_GROUP_NAME_MAX_UTF16_LENGTH = 50;
 
@@ -150,6 +183,121 @@ export function formatSlashGroupName(name: string, prefix = ''): string {
  * of fix as the `/card` / `/term` special cases in daemon.ts.)
  */
 export const EXISTING_SESSION_ONLY_DAEMON_COMMANDS = new Set(['/rename', '/fork', '/forklist']);
+
+let commandCodexRepository: AgentPrincipalRepository | undefined;
+const commandCodexLoginServices = new Map<string, CodexDeviceLoginService>();
+
+function getCommandCodexLoginService(larkAppId: string, deps: CommandHandlerDeps): CodexDeviceLoginService {
+  const existing = commandCodexLoginServices.get(larkAppId);
+  if (existing) return existing;
+  const bot = getBot(larkAppId).config;
+  if (bot.cliId !== 'codex') throw new Error('Codex 登录仅支持 Codex bot');
+  if (!bot.execution || bot.execution.type !== 'podman') throw new Error('Codex 登录需要 Podman bot');
+  const execution = parsePodmanExecutionConfig(bot.execution);
+  commandCodexRepository ??= new AgentPrincipalRepository(
+    createAgentPrincipalPool(),
+    loadCredentialMasterKey(),
+  );
+  const authRoot = execution.credentialCacheRoot;
+  const service = new CodexDeviceLoginService({
+    repository: commandCodexRepository,
+    runner: new PodmanCodexDeviceAuthRunner({ image: execution.image, authRoot }),
+    authPathFor: (principal, taskId) => join(
+      authRoot,
+      principalHash(principal),
+      'device-auth',
+      taskId,
+      'auth.json',
+    ),
+    canonicalAuthPathFor: principal => join(authRoot, principalHash(principal), 'codex', 'auth.json'),
+    stopSessionsForPrincipal: async key => {
+      const matches = [...deps.activeSessions.values()].filter(candidate => {
+        const binding = candidate.session.principalBinding;
+        const openId = binding?.openId ?? binding?.open_id;
+        return binding?.larkAppId === key.larkAppId && openId === key.openId;
+      });
+      for (const candidate of matches) {
+        await closeWorkerPoolSession(candidate.session.sessionId);
+      }
+    },
+  });
+  commandCodexLoginServices.set(larkAppId, service);
+  return service;
+}
+
+/** Parse the direct-message Codex login command without accepting a principal. */
+export function parseCodexModelLoginCommand(content: string):
+  | { readonly action: 'begin' | 'status' | 'logout'; readonly taskId?: string }
+  | { readonly action: 'complete'; readonly taskId: string; readonly expectedVersion: number }
+  | undefined {
+  const args = content.replace(/^\/model-login\s*/iu, '').trim().split(/\s+/u).filter(Boolean);
+  if (args[0]?.toLowerCase() === 'codex') args.shift();
+  const action = (args.shift() ?? 'begin').toLowerCase();
+  if (args.length > 1 && action !== 'complete') return undefined;
+  if (action === 'begin' || action === 'status' || action === 'logout') {
+    return { action, ...(args[0] ? { taskId: args[0] } : {}) };
+  }
+  if (action === 'complete' && args[0] && args[1] !== undefined && args.length === 2
+    && /^(?:0|[1-9]\d*)$/u.test(args[1])) {
+    const expectedVersion = Number(args[1]);
+    if (Number.isSafeInteger(expectedVersion)) return { action, taskId: args[0], expectedVersion };
+  }
+  return undefined;
+}
+
+async function handleCodexModelLoginCommand(
+  rootId: string,
+  message: LarkMessage,
+  deps: CommandHandlerDeps,
+  larkAppId: string | undefined,
+  ds: DaemonSession | undefined,
+): Promise<void> {
+  const reply = (content: string) => deps.sessionReply(rootId, content, undefined, larkAppId);
+  if (!larkAppId || !message.senderId || (message.chatType ?? ds?.chatType) !== 'p2p') {
+    await reply('Codex 登录只能在 Codex bot 的私聊中进行。');
+    return;
+  }
+  let bot;
+  try { bot = getBot(larkAppId).config; } catch { await reply('当前 bot 不可用。'); return; }
+  const requested = message.content.replace(/^\/model-login\s*/iu, '').trim().split(/\s+/u).filter(Boolean);
+  const requestedMode = requested[0]?.toLowerCase();
+  if (bot.cliId !== 'codex' && (!requestedMode || requestedMode === 'api')) {
+    const pairing = createAgentCredentialsPairingLink();
+    await reply(`当前 bot 固定 harness：${bot.cliId}。请打开凭据页：${pairing.url}\n然后在本私聊发送 /pair ${pairing.code} 完成一次性配对。`);
+    return;
+  }
+  if (bot.cliId !== 'codex') { await reply('此命令仅适用于 Codex bot。'); return; }
+  if (requestedMode === 'api') {
+    const pairing = createAgentCredentialsPairingLink();
+    await reply(`当前 bot 固定 harness：codex（API 凭据）。请打开凭据页：${pairing.url}\n然后在本私聊发送 /pair ${pairing.code} 完成一次性配对。`);
+    return;
+  }
+  const parsed = parseCodexModelLoginCommand(message.content);
+  if (!parsed) { await reply('用法：/model-login codex [begin|status|complete TASK_ID EXPECTED_VERSION|logout]'); return; }
+  const key: AgentPrincipalKey = { larkAppId, openId: message.senderId };
+  try {
+    const service = getCommandCodexLoginService(larkAppId, deps);
+    if (parsed.action === 'begin') {
+      const frozenCredential = await commandCodexRepository?.getCredential(key);
+      const task = await service.begin(key, { chatType: 'p2p', botCliId: 'codex' });
+      await reply(task.verificationUri && task.userCode
+        ? `Codex 登录设备验证：\n${task.verificationUri}\n设备码：${task.userCode}\n5 分钟内完成后发送 /model-login codex status，再发送 /model-login codex complete ${task.taskId} ${frozenCredential?.credentialVersion ?? 0}。`
+        : `Codex 登录任务已开始：${task.taskId}`);
+    } else if (parsed.action === 'status') {
+      const task = await service.status(key);
+      await reply(task ? `Codex 登录状态：${task.status}${task.taskId ? ` (${task.taskId})` : ''}` : '当前没有 Codex 登录任务。');
+    } else if (parsed.action === 'complete') {
+      const credential = await service.complete(key, parsed.taskId, parsed.expectedVersion);
+      await reply(`Codex 登录完成，凭据版本 ${credential.credentialVersion}。`);
+    } else {
+      await service.logout(key, parsed.taskId);
+      await reply('Codex 已退出登录。');
+    }
+  } catch (error) {
+    logger.warn(`[${larkAppId}] model-login rejected: operation_failed`);
+    await reply('Codex 登录操作失败，请确认 bot、私聊和登录任务状态。');
+  }
+}
 
 /**
  * Adapter-scoped default passthrough commands (e.g. Codex's `/goal`).
@@ -1702,6 +1850,12 @@ export async function handleCommand(
             // its first turn and must carry the full new-topic opening — see
             // markInitialUserTurnPending below.
             const emptyStart = !pendingRawInput && !hasBufferedInput;
+            await ensureSandboxPrincipalForFork({
+              ds: current,
+              execution: botCfg.execution,
+              cliId: botCfg.cliId,
+              persist: session => sessionStore.updateSession(session),
+            });
             forkWorker(
               current,
               pendingRawInput ? '' : (wrappedInput ?? ''),
@@ -1860,6 +2014,13 @@ export async function handleCommand(
                 sessionStore.updateSession(session);
                 current.hasHistory = false;
                 activeSessions.set(key, current);
+                const botCfg = getBot(current.larkAppId).config;
+                await ensureSandboxPrincipalForFork({
+                  ds: current,
+                  execution: botCfg.execution,
+                  cliId: botCfg.cliId,
+                  persist: sessionRecord => sessionStore.updateSession(sessionRecord),
+                });
                 forkWorker(current, '', false);
                 // Brand-new CLI in a brand-new session record: it has never
                 // seen the botmux opening context either, so the next real
@@ -2289,6 +2450,11 @@ export async function handleCommand(
         else if (result.reason === 'already_claimed') await sessionReply(rootId, t('pair.already', undefined, loc));
         else await sessionReply(rootId, t('pair.not_found', undefined, loc));
         logger.info(`[${logTag}] Pair command handled: ${result.ok ? 'ok' : result.reason}`);
+        break;
+      }
+
+      case '/model-login': {
+        await handleCodexModelLoginCommand(rootId, message, deps, larkAppId, ds);
         break;
       }
 
@@ -3965,6 +4131,7 @@ export async function handleCommand(
           t('help.heading_login', undefined, loc),
           t('help.login', undefined, loc),
           t('help.login_status', undefined, loc),
+          t('help.model_login', undefined, loc),
           t('help.pair', undefined, loc),
           '',
           t('help.heading_workflow', undefined, loc),
@@ -4139,6 +4306,10 @@ export async function startCodexAppThreadSession(
 
   if (await blockRiffTakeover(ds, sessionReply)) return;
   if (await blockTakeoverWhilePendingRepo(ds, sessionReply)) return;
+  if (ds.session.execution?.type === 'podman') {
+    await sessionReply(sessionAnchorId(ds), 'Podman 会话固定使用当前 bot harness，不能切换到 Codex App thread。');
+    return;
+  }
 
   const targetSessionId = ds.session.sessionId;
   const switched = await withBotTurnMutation(ds.larkAppId, async () => {
@@ -4194,6 +4365,11 @@ export async function startAdoptSession(
   }
 
   if (await blockRiffTakeover(ds, sessionReply)) return;
+
+  if (ds.session.execution?.type === 'podman') {
+    await sessionReply(sessionAnchorId(ds), 'Podman 会话固定使用当前 bot harness，不能 adopt 外部 CLI。');
+    return;
+  }
 
   const zellij = isZellijTarget(target);
   if (!zellij && target.source === 'herdr' && target.herdrSessionName && target.herdrAgentName) {
@@ -4359,6 +4535,11 @@ export async function startResumeImportSession(
   if (await blockRiffTakeover(ds, sessionReply)) return;
   if (await blockTakeoverWhilePendingRepo(ds, sessionReply)) return;
 
+  if (ds.session.execution?.type === 'podman') {
+    await sessionReply(sessionAnchorId(ds), 'Podman 会话固定使用当前 bot harness，不能导入外部 CLI 会话。');
+    return;
+  }
+
   const targetSessionId = ds.session.sessionId;
   const resumed = await withBotTurnMutation(ds.larkAppId, async () => {
     const current = [...deps.activeSessions.values()].find(
@@ -4377,6 +4558,13 @@ export async function startResumeImportSession(
     // sandboxed, matching restore semantics). Mark history so this is a resume.
     current.hasHistory = true;
     sessionStore.updateSession(current.session);
+    const botCfg = getBot(current.larkAppId).config;
+    await ensureSandboxPrincipalForFork({
+      ds: current,
+      execution: botCfg.execution,
+      cliId: botCfg.cliId,
+      persist: session => sessionStore.updateSession(session),
+    });
     forkWorker(current, '', true);
     return { status: 'resumed' as const, anchor: sessionAnchorId(current) };
   });

@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
@@ -35,6 +35,7 @@ podmanIntegration('T5 Podman provider integration', () => {
     const dataRoot = `${sourceRepo}/apps/quant-qlib/data`;
     const knowledgeRoot = `${sourceRepo}/apps/quant-qlib/knowledge/investment-books`;
     mkdirSync(dataRoot, { recursive: true });
+    mkdirSync(`${dataRoot}/staging`, { recursive: true });
     mkdirSync(knowledgeRoot, { recursive: true });
     writeFileSync(`${dataRoot}/tracked-catalog.txt`, 'mounted data\n');
     writeFileSync(`${knowledgeRoot}/tracked-book.txt`, 'mounted book\n');
@@ -65,6 +66,19 @@ podmanIntegration('T5 Podman provider integration', () => {
       cpus: 1,
     });
     const provider = new PodmanExecutionProvider(config);
+    const privateStaging = `${root}/runtime/mount-smoke-staging`;
+    mkdirSync(privateStaging, { recursive: true });
+    const mountSmoke = spawnSync('podman', [
+      'run', '--rm', '--userns=keep-id', '--entrypoint=/bin/sh',
+      `--mount=type=bind,src=${dataRoot},dst=/shared/quant-data,ro`,
+      `--mount=type=bind,src=${privateStaging},dst=/shared/quant-data/staging,rw`,
+      T2_IMAGE,
+      '-ceu',
+      'printf private > /shared/quant-data/staging/mount-smoke.txt; test "$(cat /shared/quant-data/tracked-catalog.txt)" = "mounted data"; if printf forbidden > /shared/quant-data/forbidden.txt 2>/dev/null; then exit 42; fi',
+    ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], shell: false, timeout: 60_000 });
+    expect(mountSmoke.status, mountSmoke.stderr).toBe(0);
+    expect(readFileSync(`${privateStaging}/mount-smoke.txt`, 'utf8')).toBe('private');
+    expect(existsSync(`${dataRoot}/forbidden.txt`)).toBe(false);
     const cases = [
       { sessionId: 'integration-codex', cliId: 'codex', credentialBinding: { kind: 'codex_chatgpt', version: 1 } },
       { sessionId: 'integration-claude', cliId: 'claude-code', credentialBinding: { kind: 'api', version: 1, baseUrl: 'https://api.example.com/v1', model: 'claude-test' }, credentialSecret: 'integration-api-secret-claude' },

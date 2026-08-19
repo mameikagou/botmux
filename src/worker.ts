@@ -360,6 +360,21 @@ import {
   fixedPodmanCliBinary,
   type PreparedExecution,
 } from './execution/podman-provider.js';
+import {
+  createDataPublishCapability,
+  DATA_PUBLISH_CAPABILITY_BASENAME,
+  publishDataCapability,
+} from './services/agent-data-publish-relay.js';
+import { LakePublishHostBridge } from './services/agent-lake-publish-bridge.js';
+import {
+  AgentPrincipalRepository,
+  createAgentPrincipalPool,
+} from './services/agent-principal-store.js';
+import { loadCredentialMasterKey } from './services/agent-principal-crypto.js';
+import {
+  CodexAuthRefreshWatcher,
+  shouldStartCodexAuthRefreshWatcher,
+} from './services/codex-device-login.js';
 
 // A worker must never trust an INHERITED session-level CLI home pointer
 // (CLAUDE_CONFIG_DIR / CODEX_HOME): a stale pm2 dump can resurrect the daemon
@@ -453,10 +468,22 @@ let backend: SessionBackend | null = null;
 /** Present only for a frozen T5 execution session. Never used for host CLIs. */
 let podmanExecutionProvider: PodmanExecutionProvider | null = null;
 let podmanPreparedExecution: PreparedExecution | null = null;
+/** Rotated at each accepted turn; only the capability file is host-readable. */
+let podmanDataPublishCapability: ReturnType<typeof createDataPublishCapability> | undefined;
+let podmanAuthRefreshWatcher: CodexAuthRefreshWatcher | undefined;
+let podmanCredentialPool: ReturnType<typeof createAgentPrincipalPool> | undefined;
+let podmanLakePublishBridge: LakePublishHostBridge | undefined;
+
+function stopPodmanAuthRefreshWatcher(): void {
+  podmanAuthRefreshWatcher?.stop();
+  podmanAuthRefreshWatcher = undefined;
+}
 let podmanStopPromise: Promise<void> | null = null;
 let workerExitPromise: Promise<void> | null = null;
 
 function stopPreparedPodmanExecution(): void {
+  revokePodmanDataPublishCapability();
+  stopPodmanAuthRefreshWatcher();
   if (!podmanExecutionProvider || !podmanPreparedExecution || podmanStopPromise) return;
   const provider = podmanExecutionProvider;
   const prepared = podmanPreparedExecution;
@@ -2545,8 +2572,21 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
       break;
     }
   }
+  if (podmanPreparedExecution) {
+    try {
+      podmanDataPublishCapability = createDataPublishCapability(sessionId!, 5 * 60_000, Date.now(), {
+        turnId: currentBotmuxTurnId,
+        dispatchAttempt: currentBotmuxDispatchAttempt,
+      });
+      publishDataCapability(podmanPreparedExecution.runtime.outboxRoot, podmanDataPublishCapability);
+    } catch (err: any) {
+      log(`Failed to publish data-lake capability: ${err?.message ?? err}`);
+      publishError ??= err;
+    }
+  }
 
   if (publishError) {
+    podmanDataPublishCapability = undefined;
     // The disk/daemon/worker views must rotate as one authority generation. If
     // the child-visible transport cannot publish the new token, revoke the old
     // generation and leave no in-memory authority for ready/send preflights to
@@ -2595,6 +2635,23 @@ function unlinkManagedOriginCapabilityFiles(): void {
   }
 }
 
+function revokePodmanDataPublishCapability(
+  turnId?: string,
+  dispatchAttempt?: number,
+): void {
+  const current = podmanDataPublishCapability;
+  if (current && turnId !== undefined
+    && (current.turnId !== turnId || current.dispatchAttempt !== dispatchAttempt)) return;
+  // Clear the in-memory authority before unlinking the child-visible hint. A
+  // delayed relay callback therefore fails closed even if filesystem cleanup
+  // is racing with it.
+  podmanDataPublishCapability = undefined;
+  const outbox = podmanPreparedExecution?.runtime.outboxRoot;
+  if (outbox) {
+    try { unlinkSync(join(outbox, DATA_PUBLISH_CAPABILITY_BASENAME)); } catch { /* absent or teardown racing */ }
+  }
+}
+
 function completeManagedTurnOriginRevocation(
   revoked: typeof sandboxRelayCapability,
   turnId: string | undefined,
@@ -2604,6 +2661,7 @@ function completeManagedTurnOriginRevocation(
   // can otherwise win the small window between terminal publication and
   // revocation by submitting through the still-live host relay.
   sandboxRelayCapability = null;
+  revokePodmanDataPublishCapability(turnId, dispatchAttempt);
   currentVcMeetingImTurnOrigin = undefined;
   if (sessionId) {
     send({
@@ -11448,6 +11506,43 @@ async function spawnCli(
       principalBinding: cfg.principalBinding,
       credentialBinding: cfg.credentialBinding,
     });
+    // Construct lazily on the first T3 request so a worker can still boot
+    // without a research DB configured; the relay itself remains fail-closed
+    // until this host adapter accepts the exact request envelope.
+    podmanLakePublishBridge = undefined;
+    if (cfg.principalBinding && cfg.credentialBinding
+      && shouldStartCodexAuthRefreshWatcher({
+        cliId: cfg.cliId,
+        credentialKind: cfg.credentialBinding.kind ?? cfg.credentialBinding.credentialKind,
+      })) {
+      const openId = cfg.principalBinding.openId ?? cfg.principalBinding.open_id;
+      const version = cfg.credentialBinding.version ?? cfg.credentialBinding.credentialVersion;
+      if (openId && Number.isSafeInteger(version) && (version as number) > 0) {
+        try {
+          podmanCredentialPool ??= createAgentPrincipalPool();
+          const repository = new AgentPrincipalRepository(podmanCredentialPool, loadCredentialMasterKey());
+          podmanAuthRefreshWatcher = new CodexAuthRefreshWatcher({
+            authPath: podmanPreparedExecution.runtime.codexAuthPath,
+            key: { larkAppId: cfg.larkAppId, openId },
+            repository,
+            credentialVersion: version as number,
+            onVersionConflict: () => {
+              log('Codex auth refresh lost the credential version lease; stopping this sandbox instance');
+              stopPreparedPodmanExecution();
+            },
+            onRefreshFailure: (error) => {
+              log(`Codex auth refresh failed closed: ${(error as Error).message}`);
+              stopPreparedPodmanExecution();
+            },
+          });
+          podmanAuthRefreshWatcher.start();
+        } catch (error) {
+          log(`Codex auth refresh watcher unavailable; refusing to keep sandbox alive: ${(error as Error).message}`);
+          stopPreparedPodmanExecution();
+          throw new Error('Codex auth refresh watcher unavailable');
+        }
+      }
+    }
     // Every host-side transcript/resume probe must see the same clone and home
     // that the container binds. The CLI itself receives the container paths in
     // buildArgs and --workdir below.
@@ -11460,6 +11555,7 @@ async function spawnCli(
   } else {
     podmanExecutionProvider = null;
     podmanPreparedExecution = null;
+    podmanLakePublishBridge = undefined;
   }
   // backendType trust-but-verify + HARD GATE (PTY 退役): an explicit per-bot
   // config (or BACKEND_TYPE env override) bypasses config.ts's default, so the
@@ -13235,7 +13331,26 @@ async function spawnCli(
       sandboxRelayOutbox,
       childEnv,
       cfg.sessionId,
-      { authorize: authorizeManagedSend },
+      {
+        authorize: authorizeManagedSend,
+        dataPublish: {
+          sessionStagingRoot: podmanPreparedExecution.runtime.stagingRoot,
+          expectedSessionHash: podmanPreparedExecution.runtime.sessionHash,
+          expectedOwnerOpenIdHash: podmanPreparedExecution.runtime.principalHash,
+          capability: () => podmanDataPublishCapability,
+          onRequest: async request => {
+            podmanLakePublishBridge ??= new LakePublishHostBridge({
+              qlibRoot: join(cfg.execution!.sourceRepo, 'apps', 'quant-qlib'),
+            });
+            await podmanLakePublishBridge.submit({
+              request,
+              sessionStagingRoot: podmanPreparedExecution!.runtime.stagingRoot,
+              expectedSessionHash: podmanPreparedExecution!.runtime.sessionHash,
+              expectedOwnerOpenIdHash: podmanPreparedExecution!.runtime.principalHash,
+            });
+          },
+        },
+      },
     );
     publishSandboxRelayCapability();
   }
@@ -13490,6 +13605,10 @@ async function spawnCli(
         BOTMUX_USAGE_DISPLAY: resolveUsageDisplay(cfg.larkAppId),
         BOTMUX_DAEMON_IPC_PORT: process.env.BOTMUX_DAEMON_IPC_PORT,
         BOTMUX_SESSION_SCOPE: cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat',
+        QRANT_SESSION_STAGING_ROOT: '/workspace/analyze/apps/quant-qlib/data/staging',
+        QRANT_SESSION_OUTBOX_DIR: '/session/outbox',
+        QRANT_SESSION_HASH: podmanPreparedExecution.runtime.sessionHash,
+        QRANT_OWNER_OPEN_ID_HASH: podmanPreparedExecution.runtime.principalHash,
       },
     });
     spawnBin = podmanLaunch.bin;
@@ -17337,6 +17456,7 @@ function teardownSandboxBestEffort(): void {
   sandboxStopWatcher = null;
   try { sandboxCleanup?.(); } catch { /* */ }
   sandboxCleanup = null;
+  revokePodmanDataPublishCapability();
   unlinkManagedOriginCapabilityFiles();
   sandboxRelayCapability = null;
   if (seatbeltProfilePath) { try { unlinkSync(seatbeltProfilePath); } catch { /* */ } seatbeltProfilePath = null; }

@@ -481,7 +481,7 @@ vi.mock('../src/services/card-mode-store.js', () => ({
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession } from '../src/core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation, parseCodexModelLoginCommand, buildAgentCredentialsPairingUrl, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession } from '../src/core/command-handler.js';
 import { setCardMode } from '../src/services/card-mode-store.js';
 import { writeRoleFile, deleteRoleFile, writeTeamRoleFile, deleteTeamRoleFile, resolveRole, resolveRoleFile } from '../src/core/role-resolver.js';
 import { setBotCapability, clearBotCapability } from '../src/services/bot-profile-store.js';
@@ -637,7 +637,7 @@ function mockCodexAppBot(): void {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/fork', '/forklist', '/card', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/vc-auth'];
+    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/model-login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/fork', '/forklist', '/card', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/vc-auth'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -673,12 +673,40 @@ describe('DAEMON_COMMANDS set', () => {
     // 33 = current master command set (32) + /forklist.
     // /fork and /issue remain first-class daemon commands. /subscribe-lark-doc remains
     // as its original per-file API subscription command rather than an alias.
-    expect(DAEMON_COMMANDS.size).toBe(33);
+    expect(DAEMON_COMMANDS.size).toBe(34);
   });
 
   it('contains the /list-slash-command lister and its /slash alias', () => {
     expect(DAEMON_COMMANDS.has('/list-slash-command')).toBe(true);
     expect(DAEMON_COMMANDS.has('/slash')).toBe(true);
+  });
+});
+
+describe('direct Codex model-login parser', () => {
+  it('requires an explicit frozen credential version for completion', () => {
+    expect(parseCodexModelLoginCommand('/model-login codex begin')).toEqual({ action: 'begin' });
+    expect(parseCodexModelLoginCommand('/model-login codex complete task-1')).toBeUndefined();
+    expect(parseCodexModelLoginCommand('/model-login codex complete task-1 0'))
+      .toEqual({ action: 'complete', taskId: 'task-1', expectedVersion: 0 });
+    expect(parseCodexModelLoginCommand('/model-login codex complete task-1 2'))
+      .toEqual({ action: 'complete', taskId: 'task-1', expectedVersion: 2 });
+    expect(parseCodexModelLoginCommand('/model-login codex complete task-1 -1')).toBeUndefined();
+  });
+
+  it('does not accept a body-selected principal or extra command arguments', () => {
+    expect(parseCodexModelLoginCommand('/model-login codex complete task-1 0 ou_other')).toBeUndefined();
+    expect(parseCodexModelLoginCommand('/model-login codex status ou_other extra')).toBeUndefined();
+  });
+});
+
+describe('agent credentials pairing URL', () => {
+  it('keeps the one-time browser bearer in the fragment, never the request URL', () => {
+    const url = buildAgentCredentialsPairingUrl('https://dashboard.example/', {
+      pairingId: 'pair/1',
+      browserToken: 'browser-secret',
+    });
+    expect(url).toBe('https://dashboard.example/agent/credentials#pairingId=pair%2F1&browserToken=browser-secret');
+    expect(url).not.toContain('?pairingId=');
   });
 });
 

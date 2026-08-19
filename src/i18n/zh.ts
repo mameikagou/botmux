@@ -642,6 +642,7 @@ export const messages: Record<string, string> = {
   'help.heading_login': '🔐 用户授权：',
   'help.login': '/login              - 飞书用户授权（可下载第三方卡片图片等）',
   'help.login_status': '/login status       - 查看授权状态',
+  'help.model_login': '/model-login codex [begin|status|complete TASK_ID|logout] - 管理 Codex ChatGPT 登录（仅私聊）',
   'help.pair': '/pair <配对码>      - 绑定团队平台网页登录配对码',
   'help.heading_workflow': '🧭 Workflow：',
   'help.workflow_run': '/workflow <目标>；/workflow run <名称> [key=value ...] - 即兴编排或运行 Saved Workflow',

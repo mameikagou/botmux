@@ -213,6 +213,8 @@ export interface DaemonSession {
   /** Daemon-selected, app-scoped session owner. Frozen for the worker lifetime;
    *  not the current-turn sender. Absent for ownerless/foreign-bot sessions. */
   ownerOpenId?: string;          // receives owner-only links and controls write-enabled access
+  /** Decrypted BYOK secret, transient only between principal lookup and worker init. */
+  credentialSecret?: string;
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
   streamCardNonce?: string;       // unique nonce for the current streaming card — embedded in button values to distinguish old vs current card
   streamCardPending?: boolean;    // true while the newest turn still needs its own streaming card

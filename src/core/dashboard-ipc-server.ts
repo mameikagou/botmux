@@ -38,6 +38,8 @@ import * as substituteModeStore from '../services/substitute-mode-store.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { normalizeCliRuntimeConfig, type CliRuntimeConfig } from '../adapters/cli/runtime.js';
 import { evaluateReadIsolationGate } from '../adapters/cli/read-isolation.js';
+import { ensureSandboxPrincipalForFork } from './agent-principal-runtime.js';
+import { stopSessionsForPrincipal } from '../services/agent-principal-lifecycle.js';
 
 /** Whether read isolation can actually be ENFORCED for this bot right now — the
  *  SAME gate the worker fail-closes on (adapter support + no wrapperCli + macOS).
@@ -986,6 +988,28 @@ ipcRoute('GET', '/api/sessions', (_req, res) => {
   jsonRes(res, 200, { sessions: composeDashboardSessionRows() });
 });
 
+/** Dashboard credential mutations use this daemon-side lifecycle fence. The
+ * request is already authenticated by the dashboard↔daemon HMAC; the app id
+ * is checked against this daemon so a caller cannot stop another bot's
+ * sessions by changing JSON identity fields. */
+ipcRoute('POST', '/api/agent/principal/stop', async (req, res) => {
+  const body = await readJsonBody<Record<string, unknown>>(req).catch(() => ({} as Record<string, unknown>));
+  const larkAppId = typeof body.larkAppId === 'string' ? body.larkAppId.trim() : '';
+  const openId = typeof body.openId === 'string' ? body.openId.trim() : '';
+  if (!larkAppId || !openId) return jsonRes(res, 400, { ok: false, error: 'invalid_principal' });
+  if (!cachedLarkAppId || larkAppId !== cachedLarkAppId) {
+    return jsonRes(res, 403, { ok: false, error: 'principal_app_mismatch' });
+  }
+  const active = listActiveSessions();
+  const stopped = await stopSessionsForPrincipal(
+    active,
+    { larkAppId, openId },
+    async ds => { await closeSession(ds.session.sessionId); },
+    { persist: session => sessionStore.updateSession(session) },
+  );
+  return jsonRes(res, 200, { ok: true, stopped });
+});
+
 ipcRoute('GET', '/api/sessions/:sessionId', (_req, res, params) => {
   const ds = findActiveBySessionId(params.sessionId);
   if (ds) return jsonRes(res, 200, { session: composeRowFromActive(ds) });
@@ -1095,7 +1119,7 @@ function postRestartNotice(ds: DaemonSession, fresh: boolean): void {
 ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) => {
   const initial = findActiveBySessionId(params.sessionId);
   if (!initial) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
-  return withBotTurnMutation(initial.larkAppId, () => {
+  return withBotTurnMutation(initial.larkAppId, async () => {
   const ds = findActiveBySessionId(params.sessionId);
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
   if (isSessionTransferring(ds)) {
@@ -1135,6 +1159,13 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) =
   // Revive it the same way the Feishu card restart does (forkWorker), so the
   // dashboard isn't a dead-end: a 409 here would leave NO working control to
   // bring the CLI back (the resume button only shows for closed sessions).
+  const botCfg = getBot(ds.larkAppId).config;
+  await ensureSandboxPrincipalForFork({
+    ds,
+    execution: botCfg.execution,
+    cliId: botCfg.cliId,
+    persist: session => sessionStore.updateSession(session),
+  });
   forkWorker(ds, '', ds.hasHistory);
   postRestartNotice(ds, true);
   jsonRes(res, 200, { ok: true, sessionId: params.sessionId, cliId, revived: true });
@@ -2200,6 +2231,13 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
   // reporting the action keeps the response honest if the guard ever broadens.)
   const woke = wake && (!ds.worker || ds.worker.killed);
   if (woke) {
+    const botCfg = getBot(ds.larkAppId).config;
+    await ensureSandboxPrincipalForFork({
+      ds,
+      execution: botCfg.execution,
+      cliId: botCfg.cliId,
+      persist: session => sessionStore.updateSession(session),
+    });
     forkWorker(ds, '', true);
   }
 

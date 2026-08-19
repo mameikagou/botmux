@@ -36,4 +36,11 @@ describe('Dashboard one-click login wiring', () => {
     expect(app).toContain('id="dashboard-one-click-login"');
     expect(app).toContain('一键登录');
   });
+
+  it('reads agent pairing credentials from the URL fragment and clears it before API calls', () => {
+    const server = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
+    expect(server).toContain("location.hash.startsWith('#')");
+    expect(server).toContain("history.replaceState(null,'',location.pathname+location.search)");
+    expect(server).not.toContain('/agent/credentials?pairingId=');
+  });
 });

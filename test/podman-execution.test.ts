@@ -102,6 +102,7 @@ describe('Podman principal/session identity and runtime paths', () => {
     expect(paths.workspaceRoot).toBe(`${paths.sessionRoot}/workspace`);
     expect(paths.homeRoot).toBe(`${paths.sessionRoot}/home`);
     expect(paths.outboxRoot).toBe(`${paths.sessionRoot}/outbox`);
+    expect(paths.stagingRoot).toBe(`${paths.sessionRoot}/staging`);
     expect(paths.codexAuthPath).toBe(`/srv/.botmux/credential-cache/${expectedPrincipal}/codex/auth.json`);
     expect(paths.sessionRoot).not.toContain('ou_user');
     expect(paths.containerName).toMatch(/^botmux-[0-9a-f]{24}$/u);
@@ -119,7 +120,7 @@ describe('Podman credential and mount plans', () => {
       authPath: runtime.codexAuthPath,
     });
     const mounts = buildPodmanMountPlan(config(), runtime, injection);
-    expect(mounts).toHaveLength(6);
+    expect(mounts).toHaveLength(7);
     expect(mounts.filter(mount => mount.kind === 'codex-auth')).toEqual([{
       source: runtime.codexAuthPath,
       target: '/home/dev/.codex/auth.json',
@@ -129,6 +130,12 @@ describe('Podman credential and mount plans', () => {
     }]);
     expect(mounts.filter(mount => mount.mode === 'ro').map(mount => mount.target))
       .toEqual(['/shared/quant-data', '/knowledge/investment-books']);
+    expect(mounts.find(mount => mount.kind === 'quant-data-staging')).toEqual({
+      source: runtime.stagingRoot,
+      target: '/shared/quant-data/staging',
+      mode: 'rw',
+      kind: 'quant-data-staging',
+    });
   });
 
   it('does not mount official auth files for API credentials', () => {

@@ -34,6 +34,7 @@ import type { CliTurnPayload } from '../types.js';
 import { withBotTurnAdmission } from './bot-turn-mutation-gate.js';
 import { stagePendingRepoSetup } from './pending-repo-journal.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+import { ensureSandboxPrincipalForFork } from './agent-principal-runtime.js';
 
 export interface TriggerSessionDeps {
   larkAppId: string;
@@ -1137,6 +1138,18 @@ async function triggerSessionTurnAdmitted(
         error: `target session ${target.session.sessionId} is not runnable (${state}); preserving its opening prompt`,
       };
     }
+    // A dormant sandbox is the only existing-topic path that needs to consult
+    // the app-scoped principal store again. Live workers keep using the
+    // session's frozen binding and never perform a per-message lookup.
+    if (!workerIsLive) {
+      const targetBotCfg = getBot(target.larkAppId).config;
+      await ensureSandboxPrincipalForFork({
+        ds: target,
+        execution: targetBotCfg.execution,
+        cliId: targetBotCfg.cliId,
+        persist: session => sessionStore.updateSession(session),
+      });
+    }
     const content = buildExistingSessionContent(
       target, prompt, larkAppId, chatId, codexAppText, codexAppApplicationContext, codexAppMessageContext,
     );
@@ -1690,6 +1703,12 @@ async function triggerSessionTurnAdmitted(
     };
   }
 
+  await ensureSandboxPrincipalForFork({
+    ds: newDs,
+    execution: bot.config.execution,
+    cliId: bot.config.cliId,
+    persist: sessionRecord => sessionStore.updateSession(sessionRecord),
+  });
   ensureSessionWhiteboard(newDs);
   // Skip the Feishu roster probe (getAvailableBots → listChatBotMembers →
   // /is_in_chat) for no-transport sessions: an apiOnly bot or an HTTP virtual

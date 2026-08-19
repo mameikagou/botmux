@@ -87,6 +87,7 @@ import { ensureDefaultOncallBound } from './services/oncall-store.js';
 import * as scheduleStore from './services/schedule-store.js';
 import { migrateSharedSchedulesAtStartup } from './services/schedule-split-migration.js';
 import { migrateOverloadAlertAtStartup } from './services/overload-alert-migration.js';
+import { ensureSandboxPrincipalForFork } from './core/agent-principal-runtime.js';
 import * as messageQueue from './services/message-queue.js';
 import { emitHookEvent, emitHookEventLocal, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
@@ -4457,6 +4458,12 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
     });
     rememberLastCliInput(ds, promptContent, wrappedInput);
     sessionStore.updateSession(ds.session);
+    await ensureSandboxPrincipalForFork({
+      ds,
+      execution: botCfg.execution,
+      cliId: botCfg.cliId,
+      persist: session => sessionStore.updateSession(session),
+    });
     forkWorker(ds, wrappedInput, ds.hasHistory);
   }
   logger.info(`[${tag(ds)}] doc-comment watch prewarm injected file=${sub.fileToken.slice(0, 12)}`);
@@ -16468,7 +16475,9 @@ export const __testOnly_onQueuedActivationSubmitted = onQueuedActivationSubmitte
  * deliberately no await between the final buffered-input snapshot, fork, and
  * release: a later handler either buffers before this block or observes the
  * live worker after it. */
-function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableBot[]): void {
+async function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableBot[]): Promise<void> {
+  const botCfg = getBot(ds.larkAppId).config;
+  await ensureSandboxPrincipalForFork({ ds, execution: botCfg.execution, cliId: botCfg.cliId, persist: session => sessionStore.updateSession(session) });
   const userPrompt = ds.pendingPrompt ?? '';
   const input = buildReservedInitialInput(ds, availableBots);
   rememberLastCliInput(ds, userPrompt, input);
@@ -16495,7 +16504,9 @@ function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableB
  * Buffer later same-anchor messages into the ordered follow-up payload carried
  * on that same raw_input IPC; a separate worker message could overtake the
  * command's text→Enter beat. */
-function forkReservedInitialRawSession(ds: DaemonSession, availableBots: AvailableBot[]): void {
+async function forkReservedInitialRawSession(ds: DaemonSession, availableBots: AvailableBot[]): Promise<void> {
+  const botCfg = getBot(ds.larkAppId).config;
+  await ensureSandboxPrincipalForFork({ ds, execution: botCfg.execution, cliId: botCfg.cliId, persist: session => sessionStore.updateSession(session) });
   const hasBufferedInput =
     (ds.pendingPrompt?.trim().length ?? 0) > 0
     || (ds.pendingAttachments?.length ?? 0) > 0
@@ -16885,7 +16896,7 @@ async function startInitialPassthroughSession(args: {
       messageId,
     });
     const availableBots = await getAvailableBots(larkAppId, chatId);
-    forkReservedInitialRawSession(ds, availableBots);
+    await forkReservedInitialRawSession(ds, availableBots);
     // fork 成功即开场已交给 CLI；fork 抛错则本轮只存在于内存，保持重发提示。
     onDurablyAdmitted?.();
     const reason = oncallEntry
@@ -16925,7 +16936,7 @@ async function startInitialPassthroughSession(args: {
     messageId,
   });
   const availableBots = await getAvailableBots(larkAppId, chatId);
-  forkReservedInitialRawSession(ds, availableBots);
+  await forkReservedInitialRawSession(ds, availableBots);
   logger.info(`[${tag(ds)}] No projects to select, queued initial raw passthrough ${commandContent.substring(0, 40)}`);
 }
 
@@ -17336,7 +17347,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
         fireSessionlessCommandDetached(
           cmd,
           anchor,
-          { ...parsed, content: commandContent, chatId },
+          { ...parsed, content: commandContent, chatId, chatType },
           larkAppId,
           invocationDeps,
         );
@@ -17727,7 +17738,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     });
     const availableBots = await getAvailableBots(larkAppId, chatId);
     await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-    forkReservedInitialSession(ds, availableBots);
+    await forkReservedInitialSession(ds, availableBots);
     // fork 成功即开场已交给 CLI；fork 抛错则开场只存在于内存，保持重发提示。
     markIngressAdmitted(ctx);
     const reason = oncallEntry
@@ -17776,7 +17787,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     });
     const availableBots = await getAvailableBots(larkAppId, chatId);
     await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-    forkReservedInitialSession(ds, availableBots);
+    await forkReservedInitialSession(ds, availableBots);
     logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
   }
 }
@@ -18204,7 +18215,7 @@ async function handleBotAdded(
         return;
       }
       armSharedReplyTarget();
-      forkReservedInitialSession(ds, availableBots);
+      await forkReservedInitialSession(ds, availableBots);
       ds.pendingTurnId = undefined;
       ds.pendingChatContext = undefined;
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 自动开工（${mode}/${scope}），workingDir=${pinnedWorkingDir}`);
@@ -18253,7 +18264,7 @@ async function handleBotAdded(
         return;
       }
       armSharedReplyTarget();
-      forkReservedInitialSession(ds, availableBots);
+      await forkReservedInitialSession(ds, availableBots);
       ds.pendingTurnId = undefined;
       ds.pendingChatContext = undefined;
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 无默认目录且无可选项目，直接开工`);
@@ -18756,7 +18767,7 @@ async function handleThreadReplyAdmitted(
       }
       // Pass mention-stripped content so /command argument parsing works.
       // chatId lets session-less handlers (e.g. /group) reach the chat roster.
-      const cmdMessage = { ...parsed, content: commandContent, chatId: threadChatId };
+      const cmdMessage = { ...parsed, content: commandContent, chatId: threadChatId, chatType: ctxChatType };
       if (isSessionlessCommandInvocation(cmd, commandContent)) {
         // Fast-ACK for /group invoked mid-thread. See fireSessionlessCommandDetached.
         fireSessionlessCommandDetached(cmd, anchor, cmdMessage, larkAppId, invocationDeps);
@@ -19039,6 +19050,13 @@ async function handleThreadReplyAdmitted(
     // envelope), which would be accepted as a fresh dispatch and overtake the
     // promoted old head — the exact defect this recovery must avoid.
     if (ds.quarantinedActivationTailPromotion && (!ds.worker || ds.worker.killed)) {
+      const recoveryBotCfg = getBot(ds.larkAppId).config;
+      await ensureSandboxPrincipalForFork({
+        ds,
+        execution: recoveryBotCfg.execution,
+        cliId: recoveryBotCfg.cliId,
+        persist: session => sessionStore.updateSession(session),
+      });
       if (forkWorker(ds, '', true)) {
         logger.info(`[${tag(ds)}] Quarantined activation-tail promotion recovered on inbound; cold-forked promoted head`);
       } else {
@@ -19415,7 +19433,7 @@ async function handleThreadReplyAdmitted(
       ensureSessionWhiteboard(newDs);
       const availableBots = await getAvailableBots(larkAppId, autoCreateChatId);
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-      forkReservedInitialSession(newDs, availableBots);
+      await forkReservedInitialSession(newDs, availableBots);
       // fork 成功即开场已交给 CLI；fork 抛错则开场只存在于内存，保持重发提示。
       markIngressAdmitted(ctx);
       const reason = oncallEntry
@@ -19454,7 +19472,7 @@ async function handleThreadReplyAdmitted(
       ensureSessionWhiteboard(newDs);
       const availableBots = await getAvailableBots(larkAppId, autoCreateChatId);
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-      forkReservedInitialSession(newDs, availableBots);
+      await forkReservedInitialSession(newDs, availableBots);
     }
 
     return;
@@ -19606,6 +19624,12 @@ async function handleThreadReplyAdmitted(
     // because worker=null at that point.
     const dsBotCfgForFork = getBot(ds.larkAppId).config;
     const selfBot = getBot(ds.larkAppId);
+    await ensureSandboxPrincipalForFork({
+      ds,
+      execution: dsBotCfgForFork.execution,
+      cliId: dsBotCfgForFork.cliId,
+      persist: session => sessionStore.updateSession(session),
+    });
     // Adopted (bridge) sessions are the user's external CLI — don't attach a
     // botmux whiteboard on re-fork. The live-worker branch above skips ensure
     // for bridge sessions (isBridge); the re-fork path must match, else a
