@@ -261,6 +261,44 @@ describe('PodmanExecutionProvider', () => {
     expect(existsSync(prepared.runtime.codexAuthPath)).toBe(false);
   });
 
+  it('drops host-only Claude plugins and maps workspace plugins into the container', async () => {
+    const fixture = makeFixture();
+    const provider = new PodmanExecutionProvider(fixture.config, {
+      commandRunner: fakeRunner([]),
+      checkImage: false,
+      hostUid: 1000,
+      hostGid: 104,
+    });
+    const prepared = await provider.prepare({
+      sessionId: 'claude-plugin-map',
+      cliId: 'claude-code',
+      principalBinding: { larkAppId: 'cli_test', openId: 'ou_test' },
+      credentialBinding: {
+        kind: 'api',
+        version: 1,
+        baseUrl: 'https://api.example.com/v1',
+        model: 'claude-test',
+      },
+    });
+    const workspacePlugin = join(prepared.hostWorkingDir, '.agent', 'plugin');
+    const launch = provider.launch(prepared, {
+      cliId: 'claude-code',
+      bin: 'claude',
+      args: [
+        '--plugin-dir', '/home/admin/.botmux/claude-plugin',
+        '--plugin-dir', workspacePlugin,
+        '--append-system-prompt', 'line one\nline two',
+      ],
+      credentialSecret: 'claude-api-secret',
+    });
+    const imageIndex = launch.args.indexOf(fixture.config.image);
+    expect(launch.args.slice(imageIndex + 2)).toEqual([
+      '--plugin-dir', '/workspace/analyze/.agent/plugin',
+      '--append-system-prompt', 'line one\nline two',
+    ]);
+    expect(launch.args).not.toContain('/home/admin/.botmux/claude-plugin');
+  });
+
  it('stops without deleting runtime and gates destructive deletion', async () => {
    const fixture = makeFixture();
     let syncStopCalls = 0;

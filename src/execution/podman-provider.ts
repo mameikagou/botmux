@@ -462,7 +462,35 @@ function checkCliLaunch(prepared: PreparedExecution, launch: PodmanCliLaunchSpec
   const actual = safeArgument(launch.bin, 'cliLaunchSpec.bin').split('/').pop();
   if (actual !== expected) fail(`adapter binary ${actual} is not the fixed ${expected} for ${prepared.cliId}`);
   if (!Array.isArray(launch.args)) fail('cliLaunchSpec.args must be an array');
-  return launch.args.map((arg, index) => safeCliArgument(arg, `cliLaunchSpec.args[${index}]`));
+  const args = launch.args.map((arg, index) => safeCliArgument(arg, `cliLaunchSpec.args[${index}]`));
+  if (prepared.cliId !== 'claude-code') return args;
+
+  const normalized: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
+    if (arg !== '--plugin-dir') {
+      normalized.push(arg);
+      continue;
+    }
+    const pluginDir = args[index + 1];
+    if (pluginDir === undefined) fail('claude --plugin-dir requires a path');
+    index += 1;
+    let containerPluginDir: string | undefined;
+    if (pluginDir === prepared.hostWorkingDir || pluginDir.startsWith(`${prepared.hostWorkingDir}/`)) {
+      containerPluginDir = join(CONTAINER_WORKDIR, relative(prepared.hostWorkingDir, pluginDir));
+    } else if (pluginDir === prepared.runtime.homeRoot || pluginDir.startsWith(`${prepared.runtime.homeRoot}/`)) {
+      containerPluginDir = join(CONTAINER_HOME, relative(prepared.runtime.homeRoot, pluginDir));
+    } else if (pluginDir === CONTAINER_WORKDIR || pluginDir.startsWith(`${CONTAINER_WORKDIR}/`)
+      || pluginDir === CONTAINER_HOME || pluginDir.startsWith(`${CONTAINER_HOME}/`)
+      || pluginDir === '/opt/agent-sandbox' || pluginDir.startsWith('/opt/agent-sandbox/')) {
+      containerPluginDir = pluginDir;
+    }
+    // The stock adapter points at the host-only ~/.botmux/claude-plugin. It is
+    // intentionally not mounted into the sandbox; the entrypoint's routing
+    // prompt and image-baked relay remain available without exposing host files.
+    if (containerPluginDir) normalized.push('--plugin-dir', containerPluginDir);
+  }
+  return normalized;
 }
 
 function validateRuntimeEnvironment(input: PodmanCliLaunchSpec['runtimeEnv']): Record<string, string> {
