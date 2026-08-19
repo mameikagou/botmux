@@ -1159,11 +1159,15 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) =
   // Revive it the same way the Feishu card restart does (forkWorker), so the
   // dashboard isn't a dead-end: a 409 here would leave NO working control to
   // bring the CLI back (the resume button only shows for closed sessions).
-  const botCfg = getBot(ds.larkAppId).config;
+  // Legacy active rows can predate bot identity hydration and carry an empty
+  // larkAppId. They are host-path sessions (no bot execution to hydrate); keep
+  // the existing refork behavior instead of turning a dashboard recovery into
+  // a getBot('') 500. Registered Podman rows still take the principal gate.
+  const botCfg = ds.larkAppId ? getBot(ds.larkAppId).config : undefined;
   await ensureSandboxPrincipalForFork({
     ds,
-    execution: botCfg.execution,
-    cliId: botCfg.cliId,
+    execution: botCfg?.execution,
+    cliId: botCfg?.cliId ?? ds.session.cliId ?? 'claude-code',
     persist: session => sessionStore.updateSession(session),
   });
   forkWorker(ds, '', ds.hasHistory);
@@ -2231,11 +2235,13 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
   // reporting the action keeps the response honest if the guard ever broadens.)
   const woke = wake && (!ds.worker || ds.worker.killed);
   if (woke) {
-    const botCfg = getBot(ds.larkAppId).config;
+    // See the restart route above: empty app ids are legacy host sessions and
+    // must remain resumable without a bot registry lookup.
+    const botCfg = ds.larkAppId ? getBot(ds.larkAppId).config : undefined;
     await ensureSandboxPrincipalForFork({
       ds,
-      execution: botCfg.execution,
-      cliId: botCfg.cliId,
+      execution: botCfg?.execution,
+      cliId: botCfg?.cliId ?? ds.session.cliId ?? 'claude-code',
       persist: session => sessionStore.updateSession(session),
     });
     forkWorker(ds, '', true);

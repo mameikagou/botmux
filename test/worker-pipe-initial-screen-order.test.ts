@@ -731,7 +731,10 @@ describe('worker pipe initial screen ordering', () => {
 
   it('hard-gates an unavailable persistent backend instead of silently falling back to pty', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-    const guardStart = source.indexOf('let effectiveBackend = cfg.backendType;');
+    // Podman intentionally forces the direct PTY transport while preserving
+    // the persistent-backend gate for host sessions; anchor on the declaration
+    // rather than the pre-Podman RHS so this contract survives that extension.
+    const guardStart = source.indexOf('let effectiveBackend =');
     const guardEnd = source.indexOf('effectiveBackendType = effectiveBackend;', guardStart);
     const guard = source.slice(guardStart, guardEnd);
 

@@ -100,6 +100,7 @@
 |------|------|
 | `/login` | 飞书用户授权，授权后可下载第三方卡片图片、以你身份调云文档/日历等 API |
 | `/login status` | 查看授权状态 |
+| `/model-login codex [begin\|status\|complete TASK_ID\|logout]` | 管理 Codex ChatGPT 登录（仅私聊） |
 | `/pair <配对码>` | 把 Web/Dashboard 端的会话与你的飞书身份配对（在网页端拿配对码，话题里发 `/pair <码>` 认领） |
 
 ## 🎭 角色（人设）

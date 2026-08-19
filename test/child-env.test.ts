@@ -295,8 +295,11 @@ describe('session CLI home scrub call sites', () => {
     // the sentinel is in the strip list. redactChildEnv covers the CLI child;
     // this covers the worker process itself so it also never exits 90.
     const src = read('core/worker-pool.ts');
-    const decl = src.slice(src.indexOf('const WORKER_REDACTED_ENV_KEYS'));
-    expect(decl.slice(0, decl.indexOf('\n'))).toContain(PM2_GRACEFUL_EXIT_CODE_ENV);
+    const declStart = src.indexOf('const WORKER_REDACTED_ENV_KEYS');
+    const declEnd = src.indexOf('] as const;', declStart);
+    expect(declStart).toBeGreaterThan(-1);
+    expect(declEnd).toBeGreaterThan(declStart);
+    expect(src.slice(declStart, declEnd)).toContain(PM2_GRACEFUL_EXIT_CODE_ENV);
   });
 });
 

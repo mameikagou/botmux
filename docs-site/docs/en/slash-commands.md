@@ -100,6 +100,7 @@ Permissions are the same as `/help`, and it doesn't occupy a session slot.
 |------|------|
 | `/login` | Lark user authorization; once authorized, you can download third-party card images and call cloud docs/calendar and other APIs as yourself |
 | `/login status` | View authorization status |
+| `/model-login codex [begin\|status\|complete TASK_ID\|logout]` | Manage Codex ChatGPT login (DM only) |
 | `/pair <pairing code>` | Pair a Web/Dashboard-side session with your Lark identity (get the pairing code on the web side, then send `/pair <code>` in the topic to claim it) |
 
 ## 🎭 Roles (Personas)
