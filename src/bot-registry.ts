@@ -6,6 +6,11 @@ import type { BackendType } from './adapters/backend/types.js';
 import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
 import type { CliId } from './adapters/cli/types.js';
 import {
+  PODMAN_CLI_IDS,
+  parsePodmanExecutionConfig,
+  type PodmanExecutionConfig,
+} from './execution/podman-execution.js';
+import {
   normalizeCliRuntimeConfig,
   type CliRuntimeConfig,
 } from './adapters/cli/runtime.js';
@@ -1140,6 +1145,8 @@ export interface BotConfig {
    */
   displayName?: string;
   cliId: CliId;
+  /** V3 shared-development runtime. Absent keeps the existing host execution path. */
+  execution?: PodmanExecutionConfig;
   /**
    * Optional distribution identity for a CLI that is protocol-compatible with
    * {@link cliId} but ships as an independent executable/release stream (for
@@ -2509,6 +2516,17 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       throw new Error(`Bot config [${i}]: cliPathOverride must exactly match cliRuntime.executable`);
     }
 
+    // V3 shared-development execution is intentionally a narrow, strict
+    // object.  Keep it separate from the legacy file-sandbox fields: an
+    // invalid Podman profile must fail closed rather than silently falling
+    // back to host execution.
+    const execution = entry.execution === undefined
+      ? undefined
+      : parsePodmanExecutionConfig(entry.execution, `Bot config [${i}].execution`);
+    if (execution !== undefined && !(PODMAN_CLI_IDS as readonly string[]).includes(entryCliId)) {
+      throw new Error(`Bot config [${i}].execution requires cliId ${PODMAN_CLI_IDS.join(', ')}`);
+    }
+
     // Parse workingDirs from comma-separated workingDir if workingDirs not explicitly set
     let workingDirs = entry.workingDirs;
     if (!workingDirs && entry.workingDir) {
@@ -2750,6 +2768,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       name: typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : undefined,
       displayName: typeof entry.displayName === 'string' && entry.displayName.trim() ? entry.displayName.trim() : undefined,
       cliId: entryCliId,
+      execution,
       cliRuntime,
       // Compatibility shadow: writers persist it for downgrade safety and the
       // loader requires an exact match so every accepted config is rollback-safe.
