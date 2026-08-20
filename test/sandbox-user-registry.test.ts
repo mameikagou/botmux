@@ -7,6 +7,7 @@ import {
   SANDBOX_USER_REGISTRY_DOWN_SQL,
   SANDBOX_USER_REGISTRY_UP_SQL,
   SandboxUserRegistryRepository,
+  applySandboxUserRegistryMigration,
   type SandboxUserRow,
 } from '../src/services/sandbox-user-registry.js';
 import type { SqlPool, SqlResult, SqlTransaction } from '../src/services/agent-principal-store.js';
@@ -44,6 +45,7 @@ describe('v4 sandbox user registry', () => {
   it('uses one stable user id for a repeated identity bind', async () => {
     const user: SandboxUserRow = {
       sandboxUserId: 'user-a', enabled: true, canOpenMemory: false, executionMode: 'podman',
+      podGeneration: 1,
       createdAt: '2026-08-20T00:00:00.000Z', updatedAt: '2026-08-20T00:00:00.000Z',
     };
     const identity = {
@@ -58,6 +60,27 @@ describe('v4 sandbox user registry', () => {
     expect(first.user.sandboxUserId).toBe('user-a');
     expect(second.user.sandboxUserId).toBe('user-a');
     expect(pool.secretLikeValues).toHaveLength(0);
+  });
+
+  it('serializes additive DDL behind the shared advisory migration lock', async () => {
+    const statements: string[] = [];
+    const pool: SqlPool = {
+      query: async <Row = Record<string, unknown>>(text: string): Promise<SqlResult<Row>> => {
+        statements.push(text);
+        return { rows: [] as Row[] };
+      },
+      connect: async () => ({
+        query: async <Row = Record<string, unknown>>(text: string): Promise<SqlResult<Row>> => {
+          statements.push(text);
+          return { rows: [] as Row[] };
+        },
+        release: () => undefined,
+      }),
+    };
+    await applySandboxUserRegistryMigration(pool);
+    expect(statements[1]).toContain('pg_advisory_xact_lock');
+    expect(statements[2]).toContain('CREATE TABLE IF NOT EXISTS sandbox_users');
+    expect(SANDBOX_USER_REGISTRY_UP_SQL).toContain('pod_generation bigint');
   });
 });
 

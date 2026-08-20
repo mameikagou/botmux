@@ -51,6 +51,8 @@ export interface SandboxUserRow extends SandboxUserKey {
   readonly enabled: boolean;
   readonly canOpenMemory: boolean;
   readonly executionMode: AgentExecutionMode;
+  /** Monotonic pod generation. Sessions freeze this value at ingress. */
+  readonly podGeneration: number;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -140,6 +142,17 @@ export class SandboxRuntimeStateConflictError extends Error {
   }
 }
 
+export class SandboxPodGenerationConflictError extends Error {
+  readonly expectedGeneration: number;
+  readonly actualGeneration?: number;
+  constructor(expectedGeneration: number, actualGeneration?: number) {
+    super('sandbox_pod_generation_conflict');
+    this.name = 'SandboxPodGenerationConflictError';
+    this.expectedGeneration = expectedGeneration;
+    this.actualGeneration = actualGeneration;
+  }
+}
+
 /** New tables are additive; v3 agent_principals remains the compatibility source. */
 export const SANDBOX_USER_REGISTRY_UP_SQL = `
 CREATE TABLE IF NOT EXISTS sandbox_users (
@@ -148,10 +161,25 @@ CREATE TABLE IF NOT EXISTS sandbox_users (
   can_openmemory boolean NOT NULL DEFAULT false,
   execution_mode text NOT NULL DEFAULT 'podman'
     CHECK (execution_mode IN ('native', 'podman')),
+  pod_generation bigint NOT NULL DEFAULT 1 CHECK (pod_generation > 0),
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   CHECK (length(trim(sandbox_user_id)) > 0)
 );
+ALTER TABLE sandbox_users
+  ADD COLUMN IF NOT EXISTS pod_generation bigint NOT NULL DEFAULT 1;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'sandbox_users'::regclass
+      AND conname = 'sandbox_users_pod_generation_check'
+  ) THEN
+    ALTER TABLE sandbox_users
+      ADD CONSTRAINT sandbox_users_pod_generation_check
+      CHECK (pod_generation > 0);
+  END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS sandbox_user_identities (
   sandbox_user_id text NOT NULL REFERENCES sandbox_users (sandbox_user_id)
@@ -261,6 +289,8 @@ function parseUser(row: Record<string, unknown>): SandboxUserRow {
     enabled: boolValue(row.enabled),
     canOpenMemory: boolValue(row.can_openmemory),
     executionMode: row.execution_mode === 'native' ? 'native' : 'podman',
+    podGeneration: Number.isSafeInteger(Number(row.pod_generation)) && Number(row.pod_generation) > 0
+      ? Number(row.pod_generation) : 1,
     createdAt: dateValue(row.created_at),
     updatedAt: dateValue(row.updated_at),
   };
@@ -415,6 +445,7 @@ export async function applySandboxUserRegistryMigration(db: SqlExecutor): Promis
   try { client = await connect.call(db); } catch (error) { throw dbError(error); }
   try {
     await client.query('BEGIN');
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext('botmux:agent-principal-migrations'))`);
     await client.query(SANDBOX_USER_REGISTRY_UP_SQL);
     await client.query('COMMIT');
   } catch (error) {
@@ -469,7 +500,7 @@ export class SandboxUserRegistryRepository {
            can_openmemory = COALESCE($3, sandbox_users.can_openmemory),
            execution_mode = COALESCE($4, sandbox_users.execution_mode),
            updated_at = now()
-         RETURNING sandbox_user_id, enabled, can_openmemory, execution_mode, created_at, updated_at`,
+         RETURNING sandbox_user_id, enabled, can_openmemory, execution_mode, pod_generation, created_at, updated_at`,
         [id, input.enabled ?? null, input.canOpenMemory ?? null, input.executionMode ?? null],
       );
       return parseUser(result.rows[0]!);
@@ -480,11 +511,42 @@ export class SandboxUserRegistryRepository {
     const id = sandboxUserIdValue(key.sandboxUserId);
     try {
       const result = await this.db.query<Record<string, unknown>>(
-        `SELECT sandbox_user_id, enabled, can_openmemory, execution_mode, created_at, updated_at
+        `SELECT sandbox_user_id, enabled, can_openmemory, execution_mode, pod_generation, created_at, updated_at
            FROM sandbox_users WHERE sandbox_user_id = $1`, [id],
       );
       return result.rows[0] ? parseUser(result.rows[0]) : undefined;
     } catch (error) { throw dbError(error); }
+  }
+
+  /**
+   * Atomically fence a replacement pod. Existing sessions keep their frozen
+   * generation and therefore cannot attach to the replacement. New sessions
+   * read the returned generation at ingress.
+   */
+  async advancePodGeneration(key: SandboxUserKey, expectedGeneration?: number): Promise<SandboxUserRow> {
+    const id = sandboxUserIdValue(key.sandboxUserId);
+    if (expectedGeneration !== undefined && (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1)) {
+      throw new TypeError('expectedGeneration must be a positive integer');
+    }
+    try {
+      const result = await this.db.query<Record<string, unknown>>(
+        `UPDATE sandbox_users
+            SET pod_generation = pod_generation + 1, updated_at = now()
+          WHERE sandbox_user_id = $1
+            AND ($2::bigint IS NULL OR pod_generation = $2)
+        RETURNING sandbox_user_id, enabled, can_openmemory, execution_mode, pod_generation, created_at, updated_at`,
+        [id, expectedGeneration ?? null],
+      );
+      if (!result.rows[0]) {
+        const current = await this.getUser({ sandboxUserId: id });
+        if (!current) throw new SandboxUserLookupError('not_found', 'sandbox user is not registered');
+        throw new SandboxPodGenerationConflictError(expectedGeneration!, current.podGeneration);
+      }
+      return parseUser(result.rows[0]);
+    } catch (error) {
+      if (error instanceof SandboxUserLookupError || error instanceof SandboxPodGenerationConflictError) throw error;
+      throw dbError(error);
+    }
   }
 
   async getIdentity(key: AgentPrincipalKey): Promise<SandboxUserIdentityRow | undefined> {
@@ -505,7 +567,7 @@ export class SandboxUserRegistryRepository {
     const [appId, openId] = keyValues(key);
     try {
       const result = await this.db.query<Record<string, unknown>>(
-        `SELECT u.sandbox_user_id, u.enabled, u.can_openmemory, u.execution_mode,
+        `SELECT u.sandbox_user_id, u.enabled, u.can_openmemory, u.execution_mode, u.pod_generation,
                 u.created_at, u.updated_at,
                 i.lark_app_id, i.open_id, i.enabled AS identity_enabled,
                 i.created_at AS identity_created_at, i.updated_at AS identity_updated_at
@@ -545,7 +607,7 @@ export class SandboxUserRegistryRepository {
       const user = await tx.query<Record<string, unknown>>(
         `INSERT INTO sandbox_users (sandbox_user_id) VALUES ($1)
          ON CONFLICT (sandbox_user_id) DO UPDATE SET updated_at = now()
-         RETURNING sandbox_user_id, enabled, can_openmemory, execution_mode, created_at, updated_at`, [userId],
+         RETURNING sandbox_user_id, enabled, can_openmemory, execution_mode, pod_generation, created_at, updated_at`, [userId],
       );
       const identity = await tx.query<Record<string, unknown>>(
         `INSERT INTO sandbox_user_identities (sandbox_user_id, lark_app_id, open_id, enabled)
@@ -599,7 +661,7 @@ export class SandboxUserRegistryRepository {
         `INSERT INTO sandbox_users (sandbox_user_id, enabled, can_openmemory, execution_mode)
          VALUES ($1, $2, $3, $4)
          ON CONFLICT (sandbox_user_id) DO UPDATE SET updated_at = now()
-         RETURNING sandbox_user_id, enabled, can_openmemory, execution_mode, created_at, updated_at`,
+         RETURNING sandbox_user_id, enabled, can_openmemory, execution_mode, pod_generation, created_at, updated_at`,
         [userId, boolValue(source.enabled, true), boolValue(source.can_openmemory), source.execution_mode === 'native' ? 'native' : 'podman'],
       );
       const identityResult = await tx.query<Record<string, unknown>>(

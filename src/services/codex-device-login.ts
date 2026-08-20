@@ -379,7 +379,7 @@ export async function materializeCodexAuthJson(input: {
   readonly authPath: string;
 }): Promise<AgentCredentialMetadata> {
   const key = safeKey(input.key);
-  const result = await input.repository.readSecret(key, input.expectedVersion);
+  const result = await input.repository.readSecret(key, input.expectedVersion, 'codex');
   writeCodexAuthJson({ authPath: input.authPath, authJson: result.secret });
   return result.metadata;
 }
@@ -554,7 +554,7 @@ export class CodexDeviceLoginService {
       }
       const authJson = readFileSync(safeAuthPath(authPath), 'utf8');
       const metadata = await this.input.repository.putCredential({
-        key, credentialKind: 'codex_chatgpt', secret: authJson, expectedVersion,
+        key, harness: 'codex', credentialKind: 'codex_chatgpt', secret: authJson, expectedVersion,
       });
       await this.input.stopSessionsForPrincipal?.(key);
       await this.input.repository.updateCodexLoginTask(taskId, { status: 'ready' });
@@ -739,7 +739,7 @@ export class CodexAuthRefreshWatcher {
     if (body === this.lastBody) return;
     try {
       const metadata = await this.input.repository.putCredential({
-        key: this.input.key, credentialKind: 'codex_chatgpt', secret: body, expectedVersion: this.credentialVersion,
+        key: this.input.key, harness: 'codex', credentialKind: 'codex_chatgpt', secret: body, expectedVersion: this.credentialVersion,
       });
       this.credentialVersion = metadata.credentialVersion;
       this.lastBody = body;
@@ -753,7 +753,7 @@ export class CodexAuthRefreshWatcher {
         // the credential and this frozen session must fail closed.
         if (this.input.repository.readSecret) {
           try {
-            const current = await this.input.repository.readSecret(this.input.key);
+            const current = await this.input.repository.readSecret(this.input.key, undefined, 'codex');
             if (current.metadata.credentialKind === 'codex_chatgpt'
               && current.metadata.credentialVersion > this.credentialVersion
               && current.secret === body) {

@@ -100,8 +100,9 @@ import { requestAgentSessionRename } from './session-rename.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { ensureSandboxPrincipalForFork } from './agent-principal-runtime.js';
-import { AgentPrincipalRepository, createAgentPrincipalPool, type AgentPrincipalKey } from '../services/agent-principal-store.js';
+import { AgentPrincipalRepository, applyAgentPrincipalMigration, createAgentPrincipalPool, type AgentPrincipalKey } from '../services/agent-principal-store.js';
 import { loadCredentialMasterKey } from '../services/agent-principal-crypto.js';
+import { applySandboxUserRegistryMigration, SandboxUserRegistryRepository } from '../services/sandbox-user-registry.js';
 import {
   CodexDeviceLoginService,
   PodmanCodexDeviceAuthRunner,
@@ -185,6 +186,7 @@ export function formatSlashGroupName(name: string, prefix = ''): string {
 export const EXISTING_SESSION_ONLY_DAEMON_COMMANDS = new Set(['/rename', '/fork', '/forklist']);
 
 let commandCodexRepository: AgentPrincipalRepository | undefined;
+let commandCodexRepositoryReady: Promise<void> | undefined;
 const commandCodexLoginServices = new Map<string, CodexDeviceLoginService>();
 
 function getCommandCodexLoginService(larkAppId: string, deps: CommandHandlerDeps): CodexDeviceLoginService {
@@ -194,10 +196,19 @@ function getCommandCodexLoginService(larkAppId: string, deps: CommandHandlerDeps
   if (bot.cliId !== 'codex') throw new Error('Codex 登录仅支持 Codex bot');
   if (!bot.execution || bot.execution.type !== 'podman') throw new Error('Codex 登录需要 Podman bot');
   const execution = parsePodmanExecutionConfig(bot.execution);
-  commandCodexRepository ??= new AgentPrincipalRepository(
-    createAgentPrincipalPool(),
-    loadCredentialMasterKey(),
-  );
+  if (!commandCodexRepository) {
+    const pool = createAgentPrincipalPool();
+    const masterKey = loadCredentialMasterKey();
+    commandCodexRepository = new AgentPrincipalRepository(
+      pool,
+      masterKey,
+      new SandboxUserRegistryRepository(pool, masterKey),
+    );
+    commandCodexRepositoryReady = (async () => {
+      await applyAgentPrincipalMigration(pool);
+      await applySandboxUserRegistryMigration(pool);
+    })();
+  }
   const authRoot = execution.credentialCacheRoot;
   const service = new CodexDeviceLoginService({
     repository: commandCodexRepository,
@@ -277,6 +288,7 @@ async function handleCodexModelLoginCommand(
   const key: AgentPrincipalKey = { larkAppId, openId: message.senderId };
   try {
     const service = getCommandCodexLoginService(larkAppId, deps);
+    await commandCodexRepositoryReady;
     if (parsed.action === 'begin') {
       const frozenCredential = await commandCodexRepository?.getCredential(key);
       const task = await service.begin(key, { chatType: 'p2p', botCliId: 'codex' });

@@ -370,6 +370,7 @@ import {
   AgentPrincipalRepository,
   createAgentPrincipalPool,
 } from './services/agent-principal-store.js';
+import { SandboxUserRegistryRepository } from './services/sandbox-user-registry.js';
 import { loadCredentialMasterKey } from './services/agent-principal-crypto.js';
 import {
   CodexAuthRefreshWatcher,
@@ -11524,7 +11525,12 @@ async function spawnCli(
       if (openId && Number.isSafeInteger(version) && (version as number) > 0) {
         try {
           podmanCredentialPool ??= createAgentPrincipalPool();
-          const repository = new AgentPrincipalRepository(podmanCredentialPool, loadCredentialMasterKey());
+          const workerMasterKey = loadCredentialMasterKey();
+          const repository = new AgentPrincipalRepository(
+            podmanCredentialPool,
+            workerMasterKey,
+            new SandboxUserRegistryRepository(podmanCredentialPool, workerMasterKey),
+          );
           podmanAuthRefreshWatcher = new CodexAuthRefreshWatcher({
             authPath: podmanPreparedExecution.runtime.codexAuthPath,
             key: { larkAppId: cfg.larkAppId, openId },

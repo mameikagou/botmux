@@ -1,5 +1,6 @@
 /** Runtime bridge from a daemon session to the app-scoped principal authority. */
-import { AgentPrincipalRepository, createAgentPrincipalPool } from '../services/agent-principal-store.js';
+import { AgentPrincipalRepository, applyAgentPrincipalMigration, createAgentPrincipalPool } from '../services/agent-principal-store.js';
+import { applySandboxUserRegistryMigration, SandboxUserRegistryRepository } from '../services/sandbox-user-registry.js';
 import type { FrozenPrincipalSkillBinding } from '../services/agent-principal-skills.js';
 import { loadCredentialMasterKey } from '../services/agent-principal-crypto.js';
 import { bindNewPodmanSession, materializeColdPodmanCredential } from './agent-principal-boundary.js';
@@ -17,12 +18,27 @@ import {
 import { principalHash, sessionHash } from '../execution/podman-execution.js';
 
 let repository: AgentPrincipalRepository | undefined;
+let repositoryMigration: Promise<void> | undefined;
 
 function getRepository(): AgentPrincipalRepository {
   if (repository) return repository;
   const pool = createAgentPrincipalPool();
-  repository = new AgentPrincipalRepository(pool, loadCredentialMasterKey());
+  const masterKey = loadCredentialMasterKey();
+  repository = new AgentPrincipalRepository(pool, masterKey, new SandboxUserRegistryRepository(pool, masterKey));
+  repositoryMigration = (async () => {
+    // Both migrations are additive and run before the first new-topic lookup;
+    // this prevents a production process from silently taking the V3 guest
+    // fallback because the V4 tables have not been created yet.
+    await applyAgentPrincipalMigration(pool);
+    await applySandboxUserRegistryMigration(pool);
+  })();
   return repository;
+}
+
+async function getRepositoryReady(): Promise<AgentPrincipalRepository> {
+  const value = getRepository();
+  await repositoryMigration;
+  return value;
 }
 
 function materializeCodexCredential(input: {
@@ -139,7 +155,7 @@ export async function ensureSandboxPrincipalForFork(input: {
   // its absence alone does not mean this topic is cold. A live worker already
   // owns the frozen binding and must never trigger a per-message DB lookup.
   if (ds.worker && !ds.worker.killed) return;
-  const principalRepository = input.repository ?? getRepository();
+  const principalRepository = input.repository ?? await getRepositoryReady();
   // Some creation paths pre-seed Session.execution from the live bot config
   // before this async boundary runs. That value is only a candidate profile,
   // not a frozen decision; the mode/binding fields are the authoritative
@@ -152,6 +168,13 @@ export async function ensureSandboxPrincipalForFork(input: {
       ownerOpenId: openId,
     });
     ds.session.executionMode = mode.executionMode;
+    if (mode.sandboxUserId !== undefined || mode.podGeneration !== undefined) {
+      if (mode.sandboxUserId === undefined || mode.podGeneration === undefined) {
+        throw new Error('stable sandbox pod binding is incomplete');
+      }
+      ds.session.sandboxUserId = mode.sandboxUserId;
+      ds.session.podGeneration = mode.podGeneration;
+    }
     if (mode.principalSkills && mode.principalSkills.length > 0) {
       ds.session.principalSkills = [...mode.principalSkills] as FrozenPrincipalSkillBinding[];
     }
@@ -234,4 +257,5 @@ export async function ensureSandboxPrincipalForFork(input: {
 
 export function __testOnly_resetAgentPrincipalRuntime(): void {
   repository = undefined;
+  repositoryMigration = undefined;
 }

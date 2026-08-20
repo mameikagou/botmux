@@ -4,6 +4,7 @@ import { AgentPrincipalLookupError, CodexLoginTaskConflictError } from '../servi
 import { validateApiCredentialEndpoint, validateApiCredentialInput } from '../services/agent-credential-policy.js';
 import { AgentCredentialProbeError } from '../services/agent-credential-probe.js';
 import type { CodexDeviceLoginService, CodexLoginTaskView } from '../services/codex-device-login.js';
+import type { SandboxUserHarness } from '../services/sandbox-user-registry.js';
 
 export interface AgentCredentialsApiRequest {
   readonly method: 'GET' | 'PUT' | 'PATCH' | 'DELETE' | 'POST';
@@ -46,6 +47,11 @@ function positiveVersion(raw: unknown): number | undefined {
   if (raw === undefined || raw === null || raw === '') return undefined;
   if (typeof raw !== 'number' || !Number.isSafeInteger(raw) || raw < 0) throw new TypeError('expectedVersion must be a non-negative integer');
   return raw;
+}
+
+function harnessForBotCli(cliId: string | undefined): SandboxUserHarness | undefined {
+  if (cliId === 'codex' || cliId === 'claude-code' || cliId === 'pi' || cliId === 'opencode') return cliId;
+  return undefined;
 }
 
 function publicCredential(credential: AgentCredentialMetadata | null | undefined): Record<string, unknown> | null {
@@ -141,10 +147,10 @@ export async function handleAgentCredentialsApi(
     if (request.path === '/api/agent/model-credential') {
       const principalError = await requireActivePrincipal(key, deps.repository);
       if (principalError) return principalError;
-      if (request.method === 'GET') return ok({ credential: publicCredential(await deps.repository.getCredential(key)) });
+      if (request.method === 'GET') return ok({ credential: publicCredential(await deps.repository.getCredential(key, harnessForBotCli(request.botCliId))) });
       if (request.method === 'DELETE') {
         const expectedVersion = positiveVersion(bodyObject(request.body ?? {}).expectedVersion);
-        const removed = await deps.repository.deleteCredential(key, expectedVersion);
+        const removed = await deps.repository.deleteCredential(key, expectedVersion, undefined, harnessForBotCli(request.botCliId));
         // Explicit deletion is a lifecycle revoke even if another actor
         // already removed the DB row; old workers may still hold its secret.
         await deps.stopSessionsForPrincipal?.(key);
@@ -170,6 +176,7 @@ export async function handleAgentCredentialsApi(
       });
       const metadata = await deps.repository.putCredential({
         key,
+        harness: harnessForBotCli(request.botCliId),
         credentialKind: 'api',
         secret: validated.key,
         baseUrl,

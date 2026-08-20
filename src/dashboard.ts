@@ -258,7 +258,8 @@ import {
   pairingRateLimitRoute,
 } from './services/agent-pairing-rate-limit.js';
 import { getDeploymentIdentity } from './services/deployment-identity.js';
-import { AgentPrincipalRepository, createAgentPrincipalPool, type AgentPrincipalKey } from './services/agent-principal-store.js';
+import { AgentPrincipalRepository, applyAgentPrincipalMigration, createAgentPrincipalPool, type AgentPrincipalKey } from './services/agent-principal-store.js';
+import { applySandboxUserRegistryMigration, SandboxUserRegistryRepository } from './services/sandbox-user-registry.js';
 import { loadCredentialMasterKey } from './services/agent-principal-crypto.js';
 import { PodmanCodexDeviceAuthRunner, CodexDeviceLoginService } from './services/codex-device-login.js';
 import { principalHash, parsePodmanExecutionConfig } from './execution/podman-execution.js';
@@ -2845,13 +2846,30 @@ function principalBrowserIdentity(req: IncomingMessage): PrincipalBrowserIdentit
 }
 
 let agentPrincipalRepository: AgentPrincipalRepository | undefined;
+let agentPrincipalMigrationReady: Promise<void> | undefined;
 function getAgentPrincipalRepository(): AgentPrincipalRepository {
   if (agentPrincipalRepository) return agentPrincipalRepository;
+  const pool = createAgentPrincipalPool();
+  const masterKey = loadCredentialMasterKey();
   agentPrincipalRepository = new AgentPrincipalRepository(
-    createAgentPrincipalPool(),
-    loadCredentialMasterKey(),
+    pool,
+    masterKey,
+    new SandboxUserRegistryRepository(pool, masterKey),
   );
+  // Dashboard is a separately managed PM2 process. Keep the guarded additive
+  // migrations as an awaited readiness promise; a first credential request
+  // must not race DDL or turn a migration failure into a generic missing row.
+  agentPrincipalMigrationReady = (async () => {
+    await applyAgentPrincipalMigration(pool);
+    await applySandboxUserRegistryMigration(pool);
+  })();
   return agentPrincipalRepository;
+}
+
+async function getAgentPrincipalRepositoryReady(): Promise<AgentPrincipalRepository> {
+  const repository = getAgentPrincipalRepository();
+  await agentPrincipalMigrationReady;
+  return repository;
 }
 
 async function stopPrincipalSessionsFromDashboard(key: AgentPrincipalKey): Promise<void> {
@@ -3039,6 +3057,7 @@ async function handleAgentCredentialsRoute(req: IncomingMessage, res: ServerResp
     : undefined;
   let result;
   try {
+    const repository = await getAgentPrincipalRepositoryReady();
     result = await handleAgentCredentialsApi({
       method: (req.method ?? 'GET') as 'GET' | 'PUT' | 'PATCH' | 'DELETE' | 'POST',
       path: url.pathname,
@@ -3048,7 +3067,7 @@ async function handleAgentCredentialsRoute(req: IncomingMessage, res: ServerResp
       chatType: 'p2p',
       botCliId: bot?.cliId,
     }, {
-      repository: getAgentPrincipalRepository(),
+      repository,
       stopSessionsForPrincipal: stopPrincipalSessionsFromDashboard,
       loginService: url.pathname === '/api/agent/model-login' ? getCodexLoginService(identity.key) : undefined,
       probeApiCredential,

@@ -74,6 +74,13 @@ export async function bindNewPodmanSession(input: {
     : resolved.principalBinding;
   input.ds.session.principalBinding = principalBinding;
   input.ds.session.credentialBinding = resolved.credentialBinding;
+  if (principalBinding.sandboxUserId !== undefined || principalBinding.podGeneration !== undefined) {
+    if (principalBinding.sandboxUserId === undefined || principalBinding.podGeneration === undefined) {
+      throw new AgentPrincipalLookupError('credential_incompatible', 'stable sandbox pod binding is incomplete');
+    }
+    input.ds.session.sandboxUserId = principalBinding.sandboxUserId;
+    input.ds.session.podGeneration = principalBinding.podGeneration;
+  }
   input.ds.session.cliId = input.cliId as PodmanCliId;
   input.persist(input.ds.session);
   return {
@@ -107,6 +114,7 @@ export async function materializeColdPodmanCredential(input: {
     key: { larkAppId: input.ds.larkAppId, openId },
     cliId: input.cliId,
     ownerOpenId: openId,
+    sandboxUserId: binding.sandboxUserId,
   });
   // A cold worker is a new process boundary. Rotation is therefore allowed to
   // refresh the non-secret frozen metadata here, while disable/delete still
@@ -123,6 +131,10 @@ export async function materializeColdPodmanCredential(input: {
     || (frozenPrincipal.ownerOpenId !== undefined
       && frozenPrincipal.ownerOpenId !== sessionOwnerOpenId)
     || frozenPrincipal.cliId !== undefined && frozenPrincipal.cliId !== input.cliId
+    || frozenPrincipal.sandboxUserId !== undefined
+      && frozenPrincipal.sandboxUserId !== resolved.principalBinding.sandboxUserId
+    || frozenPrincipal.podGeneration !== undefined
+      && frozenPrincipal.podGeneration !== resolved.principalBinding.podGeneration
     || frozenPrincipal.credentialVersion !== undefined
       && frozenPrincipal.credentialVersion !== frozenCredential.credentialVersion
     || frozenPrincipal.credentialKind !== undefined
@@ -145,6 +157,23 @@ export async function materializeColdPodmanCredential(input: {
   const refreshedCredential = resolved.credentialBinding;
   input.ds.session.principalBinding = refreshedPrincipal;
   input.ds.session.credentialBinding = refreshedCredential;
+  if (refreshedPrincipal.sandboxUserId !== undefined || refreshedPrincipal.podGeneration !== undefined) {
+    if (refreshedPrincipal.sandboxUserId === undefined || refreshedPrincipal.podGeneration === undefined) {
+      throw new AgentPrincipalLookupError('credential_incompatible', 'stable sandbox pod binding is incomplete');
+    }
+    // A cold refresh may rotate secret metadata, but it must never change the
+    // user pod generation frozen by the topic.
+    if (frozenPrincipal.sandboxUserId !== undefined
+      && refreshedPrincipal.sandboxUserId !== frozenPrincipal.sandboxUserId) {
+      throw new AgentPrincipalLookupError('credential_incompatible', 'cold session sandbox user binding changed');
+    }
+    if (frozenPrincipal.podGeneration !== undefined
+      && refreshedPrincipal.podGeneration !== frozenPrincipal.podGeneration) {
+      throw new AgentPrincipalLookupError('credential_incompatible', 'cold session pod generation changed');
+    }
+    input.ds.session.sandboxUserId = frozenPrincipal.sandboxUserId ?? refreshedPrincipal.sandboxUserId;
+    input.ds.session.podGeneration = frozenPrincipal.podGeneration ?? refreshedPrincipal.podGeneration;
+  }
   input.persist?.(input.ds.session);
   return {
     principalBinding: refreshedPrincipal,

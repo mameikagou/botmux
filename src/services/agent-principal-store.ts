@@ -17,6 +17,12 @@ import {
   type FrozenPrincipalSkillBinding,
   type AgentPrincipalSkillRow,
 } from './agent-principal-skills.js';
+import type {
+  SandboxUserHarness,
+  SandboxUserIdentityRow,
+  SandboxUserRegistryRepository,
+  SandboxUserRow,
+} from './sandbox-user-registry.js';
 
 export const AGENT_PRINCIPAL_MIGRATION_ID = '20260819_agent_principals_v1';
 
@@ -85,10 +91,21 @@ export interface FrozenPrincipalBinding extends AgentPrincipalKey {
   readonly cliId: PodmanCliId;
   readonly credentialVersion: number;
   readonly credentialKind: PodmanCredentialKind;
+  /** V4 stable user/pod identity. Both fields are required for guests. */
+  readonly sandboxUserId?: string;
+  readonly podGeneration?: number;
   readonly ownerOpenId?: string;
   /** Skill leaves read once at new-instance ingress and frozen with the topic. */
   readonly skills?: readonly FrozenPrincipalSkillBinding[];
 }
+
+/** Optional V4 authority injected by production callers. Keeping this as a
+ * structural interface lets old test/rolling callers retain the V3 path while
+ * every V4 runtime uses the stable user tables. */
+export type StableSandboxUserRegistry = Pick<
+  SandboxUserRegistryRepository,
+  'resolveUserForIdentity' | 'readSecret' | 'getCredential' | 'putCredential' | 'deleteCredential'
+>;
 
 /** Session-persisted credential metadata. */
 export interface FrozenCredentialBinding {
@@ -257,6 +274,10 @@ async function withAgentPrincipalTransaction<T>(db: SqlExecutor, operation: (tx:
 
 export async function applyAgentPrincipalMigration(db: SqlExecutor): Promise<void> {
   await withAgentPrincipalTransaction(db, async tx => {
+    // All daemon/dashboard processes may cold-start together. Serialize the
+    // additive DDL and its constraint checks on one database-wide advisory
+    // transaction lock so two first boots cannot race an ALTER/DO block.
+    await tx.query(`SELECT pg_advisory_xact_lock(hashtext('botmux:agent-principal-migrations'))`);
     await tx.query(AGENT_PRINCIPAL_UP_SQL);
     await tx.query(AGENT_CREDENTIAL_UP_SQL);
     await tx.query(AGENT_LOGIN_TASK_UP_SQL);
@@ -379,12 +400,20 @@ function decodePrincipalSkills(raw: unknown): readonly FrozenPrincipalSkillBindi
   return freezePrincipalSkillRows(rows);
 }
 
-function toDbError(error: unknown): AgentPrincipalLookupError {
+function toDbError(error: unknown): AgentPrincipalLookupError | CredentialVersionConflictError {
   // Repository policy failures are already sanitized and meaningful to the
   // caller. Do not turn a disabled/not-found principal into a misleading
   // database outage merely because the surrounding operation has a generic
   // error boundary.
   if (error instanceof AgentPrincipalLookupError) return error;
+  if (error instanceof CredentialVersionConflictError) return error;
+  const stableCode = error && typeof error === 'object' && 'code' in error
+    ? (error as { code?: unknown }).code : undefined;
+  if (stableCode === 'not_found' || stableCode === 'disabled'
+    || stableCode === 'credential_missing' || stableCode === 'credential_incompatible') {
+    const code = stableCode as AgentPrincipalLookupFailureCode;
+    return new AgentPrincipalLookupError(code, `sandbox user ${code.replace('_', ' ')}`);
+  }
   return new AgentPrincipalLookupError(
     'database_unavailable',
     // Never copy a driver error to a bot/dashboard boundary: libpq messages
@@ -395,10 +424,46 @@ function toDbError(error: unknown): AgentPrincipalLookupError {
 }
 
 export class AgentPrincipalRepository {
+  private readonly stableRegistry?: StableSandboxUserRegistry;
+
   constructor(
     private readonly db: SqlPool,
     private readonly masterKey?: Buffer,
-  ) {}
+    stableRegistry?: StableSandboxUserRegistry,
+  ) {
+    this.stableRegistry = stableRegistry;
+  }
+
+  private async resolveStableUser(key: AgentPrincipalKey): Promise<{
+    readonly user: SandboxUserRow;
+    readonly identity: SandboxUserIdentityRow;
+  } | undefined> {
+    if (!this.stableRegistry) return undefined;
+    return this.stableRegistry.resolveUserForIdentity(key);
+  }
+
+  private static harnessForCli(cliId: string): SandboxUserHarness {
+    if (cliId === 'codex') return 'codex';
+    if (cliId === 'claude-code') return 'claude-code';
+    if (cliId === 'pi') return 'pi';
+    if (cliId === 'opencode') return 'opencode';
+    throw new AgentPrincipalLookupError('credential_incompatible', 'model credential is incompatible with this fixed bot harness');
+  }
+
+  private static principalFromStableUser(
+    user: SandboxUserRow,
+    identity: SandboxUserIdentityRow,
+  ): AgentPrincipalRow {
+    return {
+      larkAppId: identity.larkAppId,
+      openId: identity.openId,
+      enabled: user.enabled && identity.enabled,
+      canOpenMemory: user.canOpenMemory,
+      executionMode: user.executionMode,
+      createdAt: user.createdAt,
+      updatedAt: user.updatedAt,
+    };
+  }
 
   async getPrincipal(key: AgentPrincipalKey): Promise<AgentPrincipalRow | undefined> {
     const [appId, openId] = keyValues(key);
@@ -440,12 +505,36 @@ export class AgentPrincipalRepository {
     await ensureDefaultPrincipalSkillRows(this.db, key);
   }
 
-  async getCredential(key: AgentPrincipalKey): Promise<AgentCredentialRecord | undefined> {
+  async getCredential(key: AgentPrincipalKey, harnessInput?: SandboxUserHarness): Promise<AgentCredentialRecord | undefined> {
     const [appId, openId] = keyValues(key);
     try {
       // Credential reads are principal operations too. Keep the repository
       // fail-closed even when a caller bypasses the narrow dashboard API.
       await this.requireEnabled(this.db, key);
+      if (this.stableRegistry) {
+        let stable: { user: SandboxUserRow; identity: SandboxUserIdentityRow } | undefined;
+        try {
+          stable = await this.resolveStableUser(key);
+        } catch (error) {
+          if ((error as { code?: unknown } | undefined)?.code !== 'not_found') throw error;
+        }
+        if (stable) {
+          const harness = harnessInput ?? 'codex';
+          const metadata = await this.stableRegistry.getCredential({ sandboxUserId: stable.user.sandboxUserId }, harness);
+          if (!metadata) return undefined;
+          return {
+            larkAppId: key.larkAppId,
+            openId: key.openId,
+            credentialKind: metadata.credentialKind,
+            ...(metadata.baseUrl ? { baseUrl: metadata.baseUrl } : {}),
+            ...(metadata.model ? { model: metadata.model } : {}),
+            credentialVersion: metadata.credentialVersion,
+            updatedAt: metadata.updatedAt,
+            encryptedSecret: Buffer.alloc(0),
+            secretNonce: Buffer.alloc(0),
+          };
+        }
+      }
       const result = await this.db.query<Record<string, unknown>>(
         `SELECT lark_app_id, open_id, credential_kind, base_url, model,
                 encrypted_secret, secret_nonce, credential_version, updated_at
@@ -462,8 +551,38 @@ export class AgentPrincipalRepository {
   async resolveExecutionModeForNewInstance(input: {
     readonly key: AgentPrincipalKey;
     readonly ownerOpenId?: string;
-  }): Promise<{ principal: AgentPrincipalRow; executionMode: AgentExecutionMode; principalSkills: readonly FrozenPrincipalSkillBinding[] }> {
+  }): Promise<{ principal: AgentPrincipalRow; executionMode: AgentExecutionMode; sandboxUserId?: string; podGeneration?: number; principalSkills: readonly FrozenPrincipalSkillBinding[] }> {
     const key = { larkAppId: textKey(input.key.larkAppId, 'larkAppId'), openId: textKey(input.key.openId, 'openId') };
+
+    // V4 stable identity is the ingress authority for guest users. A missing
+    // mapping is a deliberate fail-closed result; the legacy lookup below is
+    // retained only for owner-native identities and rolling V3 callers that
+    // did not inject the V4 registry yet.
+    if (this.stableRegistry) {
+      try {
+        const stable = await this.resolveStableUser(key);
+        if (stable) {
+          const principal = AgentPrincipalRepository.principalFromStableUser(stable.user, stable.identity);
+          if (!principal.enabled) throw new AgentPrincipalLookupError('disabled', 'sandbox user identity is disabled');
+          if (input.ownerOpenId && input.ownerOpenId !== principal.openId) {
+            throw new AgentPrincipalLookupError('disabled', 'session owner does not match the requesting principal');
+          }
+          return {
+            principal,
+            executionMode: principal.executionMode,
+            sandboxUserId: stable.user.sandboxUserId,
+            podGeneration: stable.user.podGeneration,
+            principalSkills: await this.getPrincipalSkills(key),
+          };
+        }
+      } catch (error) {
+        // The stable repository reports not_found for an owner identity that
+        // is intentionally outside the guest registry. Only that case may
+        // fall through to the native V3 owner row; all other errors are hard
+        // failures and must not silently re-enable the legacy guest path.
+        if ((error as { code?: unknown } | undefined)?.code !== 'not_found') throw error;
+      }
+    }
     let principal: AgentPrincipalRow | undefined;
     try {
       const result = await this.db.query<Record<string, unknown>>(
@@ -489,6 +608,8 @@ export class AgentPrincipalRepository {
     readonly cliId: string;
     readonly ownerOpenId?: string;
     readonly adminOverride?: boolean;
+    /** Cold workers must present the topic's frozen stable user identity. */
+    readonly sandboxUserId?: string;
   }): Promise<{ principal: AgentPrincipalRow; credential: AgentCredentialRecord; principalBinding: FrozenPrincipalBinding; credentialBinding: FrozenCredentialBinding; credentialSecret: string; principalSkills: readonly FrozenPrincipalSkillBinding[] }> {
     const key = { larkAppId: textKey(input.key.larkAppId, 'larkAppId'), openId: textKey(input.key.openId, 'openId') };
     const [appId, openId] = keyValues(key);
@@ -530,6 +651,90 @@ export class AgentPrincipalRepository {
     }
     if (principal.executionMode !== 'podman') {
       throw new AgentPrincipalLookupError('credential_incompatible', 'native principals do not use Podman credentials');
+    }
+
+    if (this.stableRegistry) {
+      // A Podman principal must have completed V4 identity migration. The old
+      // app/open credential table is intentionally not a new-instance
+      // fallback once the stable registry is wired into production.
+      let stable: { user: SandboxUserRow; identity: SandboxUserIdentityRow };
+      try {
+        stable = await this.resolveStableUser(key) as { user: SandboxUserRow; identity: SandboxUserIdentityRow };
+      } catch (error) {
+        if ((error as { code?: unknown } | undefined)?.code === 'not_found') {
+          throw new AgentPrincipalLookupError('not_found', 'sandbox user identity is not registered');
+        }
+        throw error;
+      }
+      if (!stable) throw new AgentPrincipalLookupError('not_found', 'sandbox user identity is not registered');
+      if (input.sandboxUserId !== undefined && stable.user.sandboxUserId !== input.sandboxUserId) {
+        throw new AgentPrincipalLookupError('credential_incompatible', 'cold session sandbox user binding changed');
+      }
+      if (!stable.user.enabled || !stable.identity.enabled) {
+        throw new AgentPrincipalLookupError('disabled', 'sandbox user identity is disabled');
+      }
+      if (input.ownerOpenId && input.ownerOpenId !== stable.identity.openId && !input.adminOverride) {
+        throw new AgentPrincipalLookupError('disabled', 'session owner does not match the requesting principal');
+      }
+      const harness = AgentPrincipalRepository.harnessForCli(input.cliId);
+      let stableCredential: Awaited<ReturnType<NonNullable<StableSandboxUserRegistry>['readSecret']>>;
+      try {
+        stableCredential = await this.stableRegistry.readSecret({ sandboxUserId: stable.user.sandboxUserId }, harness);
+      } catch (error) {
+        if ((error as { code?: unknown } | undefined)?.code === 'credential_missing') {
+          throw new AgentPrincipalLookupError('credential_missing', 'no compatible model credential is configured');
+        }
+        throw error;
+      }
+      if (input.ownerOpenId && input.ownerOpenId !== stable.identity.openId && !input.adminOverride) {
+        throw new AgentPrincipalLookupError('disabled', 'session owner does not match the requesting principal');
+      }
+      try { assertCredentialCompatible(input.cliId, stableCredential.metadata.credentialKind); } catch {
+        throw new AgentPrincipalLookupError('credential_incompatible', 'model credential is incompatible with this fixed bot harness');
+      }
+      const stablePrincipal = AgentPrincipalRepository.principalFromStableUser(stable.user, stable.identity);
+      const stableSkills = decodePrincipalSkills(row.principal_skills);
+      const principalBinding: FrozenPrincipalBinding = {
+        larkAppId: stable.identity.larkAppId,
+        openId: stable.identity.openId,
+        enabled: true,
+        canOpenMemory: stablePrincipal.canOpenMemory,
+        cliId: input.cliId as PodmanCliId,
+        credentialVersion: stableCredential.metadata.credentialVersion,
+        credentialKind: stableCredential.metadata.credentialKind,
+        sandboxUserId: stable.user.sandboxUserId,
+        podGeneration: stable.user.podGeneration,
+        ...(input.ownerOpenId ? { ownerOpenId: input.ownerOpenId } : {}),
+        ...(stableSkills.length > 0 ? { skills: stableSkills } : {}),
+      };
+      const credentialBinding: FrozenCredentialBinding = {
+        kind: stableCredential.metadata.credentialKind,
+        credentialVersion: stableCredential.metadata.credentialVersion,
+        ...(stableCredential.metadata.baseUrl ? { baseUrl: stableCredential.metadata.baseUrl } : {}),
+        ...(stableCredential.metadata.model ? { model: stableCredential.metadata.model } : {}),
+      };
+      const credential: AgentCredentialRecord = {
+        larkAppId: key.larkAppId,
+        openId: key.openId,
+        credentialKind: stableCredential.metadata.credentialKind,
+        ...(stableCredential.metadata.baseUrl ? { baseUrl: stableCredential.metadata.baseUrl } : {}),
+        ...(stableCredential.metadata.model ? { model: stableCredential.metadata.model } : {}),
+        credentialVersion: stableCredential.metadata.credentialVersion,
+        updatedAt: stableCredential.metadata.updatedAt,
+        // Stable credentials are decrypted only by the registry. These empty
+        // buffers preserve the old return shape without leaking/copying the
+        // ciphertext into Session or a dashboard response.
+        encryptedSecret: Buffer.alloc(0),
+        secretNonce: Buffer.alloc(0),
+      };
+      return {
+        principal: stablePrincipal,
+        credential,
+        principalBinding,
+        credentialBinding,
+        credentialSecret: stableCredential.secret,
+        principalSkills: stableSkills,
+      };
     }
     const principalSkills = decodePrincipalSkills(row.principal_skills);
     if (!row.credential_kind || row.encrypted_secret === undefined || row.secret_nonce === undefined) {
@@ -643,6 +848,8 @@ export class AgentPrincipalRepository {
   async putCredential(input: {
     readonly key: AgentPrincipalKey;
     readonly credentialKind: PodmanCredentialKind;
+    /** V4 stable harness. Omitted by legacy callers; ChatGPT is inferred. */
+    readonly harness?: SandboxUserHarness;
     readonly secret: string | Buffer;
     readonly baseUrl?: string;
     readonly model?: string;
@@ -655,6 +862,31 @@ export class AgentPrincipalRepository {
       validateApiCredentialInput({ baseUrl: input.baseUrl ?? '', model: input.model ?? '', key: typeof input.secret === 'string' ? input.secret : input.secret.toString('utf8') });
     } else if (input.baseUrl !== undefined || input.model !== undefined) {
       throw new TypeError('Codex ChatGPT credentials do not accept BaseURL or model');
+    }
+    if (this.stableRegistry) {
+      const stable = await this.resolveStableUser(key);
+      if (!stable) throw new AgentPrincipalLookupError('not_found', 'sandbox user identity is not registered');
+      const harness = input.harness ?? (input.credentialKind === 'codex_chatgpt' ? 'codex' : undefined);
+      if (!harness) throw new AgentPrincipalLookupError('credential_incompatible', 'API credential write requires an explicit harness');
+      const metadata = await this.stableRegistry.putCredential({
+        user: { sandboxUserId: stable.user.sandboxUserId },
+        harness,
+        credentialKind: input.credentialKind,
+        secret: input.secret,
+        ...(input.baseUrl !== undefined ? { baseUrl: input.baseUrl } : {}),
+        ...(input.model !== undefined ? { model: input.model } : {}),
+        ...(input.expectedVersion !== undefined ? { expectedVersion: input.expectedVersion } : {}),
+      });
+      return {
+        larkAppId: key.larkAppId,
+        openId: key.openId,
+        credentialKind: metadata.credentialKind,
+        ...(metadata.baseUrl ? { baseUrl: metadata.baseUrl } : {}),
+        ...(metadata.model ? { model: metadata.model } : {}),
+        credentialVersion: metadata.credentialVersion,
+        updatedAt: metadata.updatedAt,
+        keyFingerprint: metadata.keyFingerprint,
+      };
     }
     const encrypted = encryptCredential(input.secret, this.masterKey, key);
     let client: SqlTransaction;
@@ -697,7 +929,7 @@ export class AgentPrincipalRepository {
       );
       await client.query('COMMIT');
       const row = result.rows[0]!;
-      return {
+      const legacyMetadata: AgentCredentialMetadata = {
         larkAppId: String(row.lark_app_id), openId: String(row.open_id),
         credentialKind: String(row.credential_kind) as PodmanCredentialKind,
         ...(typeof row.base_url === 'string' ? { baseUrl: row.base_url } : {}),
@@ -705,6 +937,7 @@ export class AgentPrincipalRepository {
         credentialVersion: Number(row.credential_version), updatedAt: dateValue(row.updated_at),
         keyFingerprint: credentialFingerprint(input.secret),
       };
+      return legacyMetadata;
     } catch (error) {
       await client.query('ROLLBACK').catch(() => undefined);
       if (error instanceof CredentialVersionConflictError) throw error;
@@ -714,8 +947,48 @@ export class AgentPrincipalRepository {
     }
   }
 
-  async readSecret(key: AgentPrincipalKey, expectedVersion?: number): Promise<{ metadata: AgentCredentialMetadata; secret: string }> {
+  async readSecret(key: AgentPrincipalKey, expectedVersion?: number, harnessInput?: SandboxUserHarness): Promise<{ metadata: AgentCredentialMetadata; secret: string }> {
     if (!this.masterKey) throw new Error('credential master key is not configured');
+    if (this.stableRegistry) {
+      try {
+        const stable = await this.resolveStableUser(key);
+        if (stable) {
+          // A refresh/read caller must provide its fixed harness. Blindly
+          // scanning four slots can select a same-version credential belonging
+          // to a different CLI and inject the wrong provider.
+          const harnesses: readonly SandboxUserHarness[] = harnessInput
+            ? [harnessInput]
+            : ['codex'];
+          for (const harness of harnesses) {
+            try {
+              const result = await this.stableRegistry.readSecret(
+                { sandboxUserId: stable.user.sandboxUserId }, harness, expectedVersion,
+              );
+              return {
+                metadata: {
+                  larkAppId: key.larkAppId,
+                  openId: key.openId,
+                  credentialKind: result.metadata.credentialKind,
+                  ...(result.metadata.baseUrl ? { baseUrl: result.metadata.baseUrl } : {}),
+                  ...(result.metadata.model ? { model: result.metadata.model } : {}),
+                  credentialVersion: result.metadata.credentialVersion,
+                  updatedAt: result.metadata.updatedAt,
+                  keyFingerprint: result.metadata.keyFingerprint,
+                },
+                secret: result.secret,
+              };
+            } catch (error) {
+              if ((error as { code?: unknown } | undefined)?.code === 'credential_missing') continue;
+              if (error instanceof CredentialVersionConflictError) continue;
+              throw error;
+            }
+          }
+          throw new AgentPrincipalLookupError('credential_missing', 'credential is not configured');
+        }
+      } catch (error) {
+        if ((error as { code?: unknown } | undefined)?.code !== 'not_found') throw error;
+      }
+    }
     await this.requireEnabled(this.db, key);
     const record = await this.getCredential(key);
     if (!record) throw new AgentPrincipalLookupError('credential_missing', 'credential is not configured');
@@ -731,7 +1004,7 @@ export class AgentPrincipalRepository {
     return { metadata, secret };
   }
 
-  async deleteCredential(key: AgentPrincipalKey, expectedVersion?: number, credentialKind?: PodmanCredentialKind): Promise<boolean> {
+  async deleteCredential(key: AgentPrincipalKey, expectedVersion?: number, credentialKind?: PodmanCredentialKind, harnessInput?: SandboxUserHarness): Promise<boolean> {
     const [appId, openId] = keyValues(key);
     const values: unknown[] = [appId, openId];
     const clauses: string[] = [];
@@ -746,6 +1019,21 @@ export class AgentPrincipalRepository {
     const guard = clauses.length > 0 ? ` AND ${clauses.join(' AND ')}` : '';
     try {
       await this.requireEnabled(this.db, key);
+      if (this.stableRegistry) {
+        let stable: { user: SandboxUserRow; identity: SandboxUserIdentityRow } | undefined;
+        try {
+          stable = await this.resolveStableUser(key);
+        } catch (error) {
+          if ((error as { code?: unknown } | undefined)?.code !== 'not_found') throw error;
+        }
+        if (stable) {
+          const harness = harnessInput ?? (credentialKind === 'codex_chatgpt' || credentialKind === undefined ? 'codex' : undefined);
+          if (!harness) throw new AgentPrincipalLookupError('credential_incompatible', 'API credential deletion requires an explicit harness');
+          return await this.stableRegistry.deleteCredential(
+            { sandboxUserId: stable.user.sandboxUserId }, harness, expectedVersion,
+          );
+        }
+      }
       const result = await this.db.query(
         `DELETE FROM agent_model_credentials WHERE lark_app_id = $1 AND open_id = $2${guard}`,
         values,
