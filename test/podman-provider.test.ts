@@ -289,7 +289,7 @@ describe('PodmanExecutionProvider', () => {
         '--plugin-dir', workspacePlugin,
         '--append-system-prompt', 'line one\nline two',
       ],
-      credentialSecret: 'claude-api-secret',
+      credentialSecret: 'claude-api-secret-0123456789abcdef',
     });
     const imageIndex = launch.args.indexOf(fixture.config.image);
     expect(launch.args.slice(imageIndex + 2)).toEqual([
@@ -303,10 +303,15 @@ describe('PodmanExecutionProvider', () => {
     const fixture = makeFixture();
     const runtime = buildSessionRuntimePaths(fixture.config, { larkAppId: 'cli_test', openId: 'ou_claude_state' }, 'claude-state');
     const statePath = join(runtime.homeRoot, '.claude.json');
+    const claudeStateSecret = 'claude-state-secret-0123456789abcdef';
     mkdirSync(runtime.homeRoot, { recursive: true });
     writeFileSync(statePath, JSON.stringify({
       hasCompletedOnboarding: false,
       mcpServers: { existing: { type: 'http', url: 'https://existing.example/mcp' } },
+      customApiKeyResponses: {
+        approved: ['previous-approved'],
+        rejected: [claudeStateSecret.slice(-20), 'keep-rejected'],
+      },
       projects: {
         '/workspace/analyze': { custom: 'keep', hasTrustDialogAccepted: false },
         '/workspace/other': { custom: 'other' },
@@ -325,7 +330,7 @@ describe('PodmanExecutionProvider', () => {
       credentialBinding: {
         kind: 'api',
         version: 1,
-        baseUrl: 'https://api.example.com/v1',
+        baseUrl: 'https://api.kimi.com/coding/',
         model: 'claude-state-test',
       },
     });
@@ -346,12 +351,53 @@ describe('PodmanExecutionProvider', () => {
       cliId: 'claude-code',
       bin: 'claude',
       args: ['--version'],
-      credentialSecret: 'claude-state-secret',
+      credentialSecret: claudeStateSecret,
     });
-    expect(launch.env.ANTHROPIC_AUTH_TOKEN).toBe('claude-state-secret');
+    expect(launch.env.ANTHROPIC_API_KEY).toBe(claudeStateSecret);
+    expect(launch.env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    expect(launch.args.some(arg => arg.includes('ANTHROPIC_API_KEY'))).toBe(true);
+    expect(launch.args.some(arg => arg.includes('ANTHROPIC_AUTH_TOKEN'))).toBe(false);
+    const stateAfterLaunch = readFileSync(statePath, 'utf8');
+    expect(stateAfterLaunch).not.toContain(claudeStateSecret);
+    expect(JSON.parse(stateAfterLaunch)).toMatchObject({
+      penguinModeOrgEnabled: true,
+      customApiKeyResponses: {
+        approved: ['previous-approved', claudeStateSecret.slice(-20)],
+        rejected: ['keep-rejected'],
+      },
+    });
+  });
+
+  it('uses DeepSeek bearer auth without writing Claude API-key consent state', async () => {
+    const fixture = makeFixture();
+    const provider = new PodmanExecutionProvider(fixture.config, {
+      commandRunner: fakeRunner([]),
+      checkImage: false,
+      hostUid: 1000,
+      hostGid: 1000,
+    });
+    const prepared = await provider.prepare({
+      sessionId: 'claude-deepseek',
+      cliId: 'claude-code',
+      principalBinding: { larkAppId: 'cli_test', openId: 'ou_deepseek' },
+      credentialBinding: {
+        kind: 'api',
+        version: 1,
+        baseUrl: 'https://api.deepseek.com/anthropic',
+        model: 'deepseek-chat',
+      },
+    });
+    const launch = provider.launch(prepared, {
+      cliId: 'claude-code',
+      bin: 'claude',
+      args: ['--version'],
+      credentialSecret: 'deepseek-token',
+    });
+    expect(launch.env.ANTHROPIC_AUTH_TOKEN).toBe('deepseek-token');
     expect(launch.env.ANTHROPIC_API_KEY).toBeUndefined();
-    expect(launch.args.some(arg => arg.includes('ANTHROPIC_AUTH_TOKEN'))).toBe(true);
-    expect(launch.args.some(arg => arg.includes('ANTHROPIC_API_KEY'))).toBe(false);
+    const state = JSON.parse(readFileSync(join(prepared.runtime.homeRoot, '.claude.json'), 'utf8')) as Record<string, unknown>;
+    expect(state.customApiKeyResponses).toBeUndefined();
+    expect(state.penguinModeOrgEnabled).toBeUndefined();
   });
 
  it('stops without deleting runtime and gates destructive deletion', async () => {
@@ -575,7 +621,7 @@ describe('PodmanExecutionProvider', () => {
       cliId: 'claude-code',
       bin: 'claude',
       args: ['--version'],
-      credentialSecret: 'claude-owner-api-secret',
+      credentialSecret: 'claude-owner-api-secret-0123456789abcdef',
     });
     expect(launch.args.join('\n')).not.toContain(capability);
     expect(launch.env.BOTMUX_MEMORY_CAPABILITY).toBe(capability);

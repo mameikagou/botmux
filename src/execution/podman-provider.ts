@@ -30,6 +30,7 @@ import {
   buildPodmanMountPlan,
   buildSessionRuntimePaths,
   fixedBotCliId,
+  isKimiClaudeProvider,
   materializeCredentialEnvironment,
   parsePodmanExecutionConfig,
   type CredentialInjectionPlan,
@@ -740,7 +741,10 @@ export class PodmanExecutionProvider {
         // Claude's onboarding/trust state belongs to this disposable session
         // home.  Seed only the flags for the mounted container cwd and merge
         // the existing object so user/provider MCP entries survive restarts.
-        ensureClaudeState(runtime.homeRoot);
+        ensureClaudeState(runtime.homeRoot, {
+          kimiProvider: credential.providerConfig?.baseUrl !== undefined
+            && isKimiClaudeProvider(credential.providerConfig.baseUrl),
+        });
       }
       if (memoryGate) {
         ensureMemoryMcpConfig(runtime.homeRoot, cliId, memoryGate);
@@ -922,6 +926,10 @@ export class PodmanExecutionProvider {
       prepared.credential,
       prepared.credential.credentialKind === 'api' ? launch.credentialSecret : undefined,
     );
+    if (prepared.cliId === 'claude-code'
+      && prepared.credential.secretEnvVar === 'ANTHROPIC_API_KEY') {
+      ensureClaudeApiKeyApproval(prepared.runtime.homeRoot, launch.credentialSecret!);
+    }
     const runtimeEnvironment = validateRuntimeEnvironment(launch.runtimeEnv);
     const containerEnv: Record<string, string> = {
       HOME: CONTAINER_HOME,
@@ -1120,7 +1128,7 @@ function ensureProviderConfig(path: string, plan: NonNullable<CredentialInjectio
   chmodSync(parsed, 0o600);
 }
 
-function ensureClaudeState(sessionHome: string): void {
+function ensureClaudeState(sessionHome: string, options: { readonly kimiProvider?: boolean } = {}): void {
   const path = join(sessionHome, '.claude.json');
   ensureDirectory(dirname(path));
   if (existsSync(path)) {
@@ -1155,6 +1163,7 @@ function ensureClaudeState(sessionHome: string): void {
   }
 
   data.hasCompletedOnboarding = true;
+  if (options.kimiProvider) data.penguinModeOrgEnabled = true;
   data.projects = {
     ...projects,
     [CONTAINER_WORKDIR]: {
@@ -1165,6 +1174,62 @@ function ensureClaudeState(sessionHome: string): void {
   };
   writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
   chmodSync(path, 0o600);
+}
+
+function ensureClaudeApiKeyApproval(sessionHome: string, secret: string): void {
+  // Claude only needs the suffix to match its consent record. Refuse short
+  // keys rather than persisting the complete secret in ~/.claude.json.
+  if (secret.length <= 20) fail('Claude API key must be longer than 20 characters');
+  const path = join(sessionHome, '.claude.json');
+  ensureDirectory(dirname(path));
+  if (existsSync(path)) {
+    const stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink()) fail(`Claude state is not a regular file: ${path}`);
+  }
+
+  let data: Record<string, unknown> = {};
+  if (existsSync(path)) {
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        fail('Claude state must be an object');
+      }
+      data = parsed as Record<string, unknown>;
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith('[podman]')) throw error;
+      fail('Claude state is invalid');
+    }
+  }
+
+  const currentResponses = data.customApiKeyResponses;
+  if (currentResponses !== undefined
+    && (!currentResponses || typeof currentResponses !== 'object' || Array.isArray(currentResponses))) {
+    fail('Claude custom API key responses must be an object');
+  }
+  const responses = (currentResponses ?? {}) as Record<string, unknown>;
+  const approved = claudeResponseList(responses.approved, 'approved');
+  const rejected = claudeResponseList(responses.rejected, 'rejected');
+  const fingerprint = secret.slice(-20);
+  const approvedWithoutFullSecret = approved.filter(entry => entry !== secret);
+  const nextApproved = approvedWithoutFullSecret.includes(fingerprint)
+    ? approvedWithoutFullSecret
+    : [...approvedWithoutFullSecret, fingerprint];
+  const nextRejected = rejected.filter(entry => entry !== fingerprint && entry !== secret);
+  data.customApiKeyResponses = {
+    ...responses,
+    approved: nextApproved,
+    rejected: nextRejected,
+  };
+  writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
+  chmodSync(path, 0o600);
+}
+
+function claudeResponseList(value: unknown, name: string): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some(entry => typeof entry !== 'string')) {
+    fail(`Claude custom API key responses.${name} must be an array of strings`);
+  }
+  return [...value] as string[];
 }
 
 function controlledTomlSection(header: string, removeProvider: boolean, removeMemory: boolean): boolean {

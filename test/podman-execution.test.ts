@@ -151,13 +151,29 @@ describe('Podman credential and mount plans', () => {
     const mounts = buildPodmanMountPlan(config(), runtime, injection);
     expect(mounts.some(mount => mount.kind === 'codex-auth')).toBe(false);
     expect(injection.providerConfig?.path).toBe(`${runtime.homeRoot}/.agent/providers/claude.json`);
-    expect(injection.secretEnvVar).toBe('ANTHROPIC_AUTH_TOKEN');
+    expect(injection.secretEnvVar).toBe('ANTHROPIC_API_KEY');
     expect(JSON.stringify(injection)).not.toContain('sk-test');
     expect(materializeCredentialEnvironment(injection, 'sk-test')).toMatchObject({
-      ANTHROPIC_AUTH_TOKEN: 'sk-test',
+      ANTHROPIC_API_KEY: 'sk-test',
       ANTHROPIC_BASE_URL: 'https://api.example.com/v1',
       ANTHROPIC_MODEL: 'claude-sonnet',
     });
+  });
+
+  it('selects Claude auth variables by the provider hostname', () => {
+    const runtime = buildSessionRuntimePaths(config(), { larkAppId: 'cli_app', openId: 'ou_user' }, 'provider-auth');
+    const plan = (baseUrl: string) => buildCredentialInjectionPlan({
+      cliId: 'claude-code',
+      credentialKind: 'api',
+      credentialVersion: 1,
+      sessionHome: runtime.homeRoot,
+      baseUrl,
+      model: 'claude-sonnet',
+    });
+
+    expect(plan('https://api.deepseek.com/anthropic').secretEnvVar).toBe('ANTHROPIC_AUTH_TOKEN');
+    expect(plan('https://api.kimi.com/coding/').secretEnvVar).toBe('ANTHROPIC_API_KEY');
+    expect(plan('https://api.anthropic.com/v1').secretEnvVar).toBe('ANTHROPIC_API_KEY');
   });
 
   it('enforces fixed bot cliId and credential compatibility', () => {

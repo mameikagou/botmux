@@ -452,7 +452,27 @@ export function assertCredentialCompatible(cliId: string, credentialKind: string
   }
 }
 
-function credentialContract(cliId: PodmanCliId): {
+function providerHostname(baseUrl: string): string {
+  // `baseUrl` has already passed validateCredentialBaseUrl() by the time this
+  // helper is called. Keep the normalization here so provider matching is
+  // case-insensitive and does not accidentally treat a lookalike suffix as a
+  // supported provider.
+  return new URL(baseUrl).hostname.toLowerCase().replace(/\.$/u, '');
+}
+
+/** Claude's bearer-token exception is intentionally limited to DeepSeek. */
+export function claudeSecretEnvVarForBaseUrl(baseUrl: string): 'ANTHROPIC_API_KEY' | 'ANTHROPIC_AUTH_TOKEN' {
+  return providerHostname(baseUrl) === 'api.deepseek.com'
+    ? 'ANTHROPIC_AUTH_TOKEN'
+    : 'ANTHROPIC_API_KEY';
+}
+
+/** Kimi Code's Claude compatibility mode is enabled by a top-level flag. */
+export function isKimiClaudeProvider(baseUrl: string): boolean {
+  return providerHostname(baseUrl) === 'api.kimi.com';
+}
+
+function credentialContract(cliId: PodmanCliId, baseUrl?: string): {
   secretEnvVar: string;
   baseUrlEnvVar: string;
   modelEnvVar: string;
@@ -470,10 +490,11 @@ function credentialContract(cliId: PodmanCliId): {
       };
     case 'claude-code':
       return {
-        // Claude treats ANTHROPIC_API_KEY as an interactive custom-key
-        // acknowledgement path.  The sandbox contract uses the bearer-token
-        // variable so API credentials never trigger that login prompt.
-        secretEnvVar: 'ANTHROPIC_AUTH_TOKEN',
+        // Claude's standard and Kimi endpoints use the API-key consent path;
+        // DeepSeek's Anthropic-compatible endpoint expects a bearer token.
+        secretEnvVar: baseUrl === undefined
+          ? 'ANTHROPIC_API_KEY'
+          : claudeSecretEnvVarForBaseUrl(baseUrl),
         baseUrlEnvVar: 'ANTHROPIC_BASE_URL',
         modelEnvVar: 'ANTHROPIC_MODEL',
         configRelativePath: '.agent/providers/claude.json',
@@ -574,7 +595,7 @@ export function buildCredentialInjectionPlan(input: {
 
   const baseUrl = validateCredentialBaseUrl(input.baseUrl, 'baseUrl');
   const model = requireNonEmptyString(input.model, 'model');
-  const contract = credentialContract(cliId);
+  const contract = credentialContract(cliId, baseUrl);
   const providerConfigPath = join(sessionHome, contract.configRelativePath);
   return {
     cliId,
