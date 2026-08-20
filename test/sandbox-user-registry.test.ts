@@ -62,6 +62,49 @@ describe('v4 sandbox user registry', () => {
     expect(pool.secretLikeValues).toHaveLength(0);
   });
 
+  it('preserves runtime pod generations across 2 -> 3 state transitions', async () => {
+    const pool = new RuntimePool();
+    const repository = new SandboxUserRegistryRepository(pool, Buffer.alloc(32, 0x44));
+    const runtime = await repository.createRuntime({
+      sandboxUserId: 'user-a', sessionId: 'session-a', podGeneration: 2,
+      harness: 'claude-code', imageDigest: 'localhost/botmux:test@sha256:' + 'a'.repeat(64),
+    });
+    expect(runtime.podGeneration).toBe(2);
+    const running = await repository.updateRuntimeState({
+      runtimeId: runtime.runtimeId, state: 'running', expectedState: 'provisioning',
+    });
+    expect(running.podGeneration).toBe(2);
+    const stopped = await repository.updateRuntimeState({
+      runtimeId: runtime.runtimeId, state: 'stopped', expectedState: 'running',
+    });
+    expect(stopped.podGeneration).toBe(2);
+
+    const replacement = await repository.createRuntime({
+      sandboxUserId: 'user-a', sessionId: 'session-b', podGeneration: 3,
+      harness: 'claude-code', imageDigest: 'localhost/botmux:test@sha256:' + 'b'.repeat(64),
+    });
+    expect((await repository.updateRuntimeState({
+      runtimeId: replacement.runtimeId, state: 'running', expectedState: 'provisioning',
+    })).podGeneration).toBe(3);
+  });
+
+  it('rejects rows whose pod generation is missing instead of defaulting to 1', async () => {
+    const user: SandboxUserRow = {
+      sandboxUserId: 'user-missing-generation', enabled: true, canOpenMemory: false, executionMode: 'podman',
+      podGeneration: 1,
+      createdAt: '2026-08-20T00:00:00.000Z', updatedAt: '2026-08-20T00:00:00.000Z',
+    };
+    const pool = new ScriptedPool({
+      user,
+      identity: { sandbox_user_id: user.sandboxUserId, lark_app_id: 'app', open_id: 'open', enabled: true },
+      rows: [],
+      omitGeneration: true,
+    });
+    const repository = new SandboxUserRegistryRepository(pool, Buffer.alloc(32, 0x44));
+    await expect(repository.createUser({ sandboxUserId: user.sandboxUserId }))
+      .rejects.toMatchObject({ code: 'database_unavailable' });
+  });
+
   it('serializes additive DDL behind the shared advisory migration lock', async () => {
     const statements: string[] = [];
     const pool: SqlPool = {
@@ -91,6 +134,7 @@ class ScriptedPool implements SqlPool {
     readonly user: SandboxUserRow;
     readonly identity: Record<string, unknown>;
     readonly rows: Record<string, unknown>[];
+    readonly omitGeneration?: boolean;
   }) {}
 
   async connect(): Promise<SqlTransaction> {
@@ -112,18 +156,61 @@ class ScriptedPool implements SqlPool {
       return { rows: [this.state.identity] as Row[] };
     }
     if (text.includes('INSERT INTO sandbox_users')) {
-      return { rows: [{
+      const row: Record<string, unknown> = {
         sandbox_user_id: this.state.user.sandboxUserId,
         enabled: this.state.user.enabled,
         can_openmemory: this.state.user.canOpenMemory,
         execution_mode: this.state.user.executionMode,
+        pod_generation: this.state.user.podGeneration,
         created_at: this.state.user.createdAt,
         updated_at: this.state.user.updatedAt,
-      }] as Row[] };
+      };
+      if (this.state.omitGeneration) delete row.pod_generation;
+      return { rows: [row] as Row[] };
     }
     if (text.includes('INSERT INTO sandbox_user_identities')) {
       return { rows: [this.state.identity] as Row[] };
     }
     return { rows: [] as Row[], rowCount: 0 };
+  }
+}
+
+class RuntimePool implements SqlPool {
+  private row: Record<string, unknown> | undefined;
+
+  async connect(): Promise<SqlTransaction> {
+    return {
+      query: async <Row = Record<string, unknown>>(text: string, values: readonly unknown[] = []) => {
+        if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') return { rows: [] as Row[] };
+        return this.query<Row>(text, values);
+      },
+      release: () => undefined,
+    };
+  }
+
+  async query<Row = Record<string, unknown>>(text: string, values: readonly unknown[] = []): Promise<SqlResult<Row>> {
+    if (text.includes('INSERT INTO sandbox_pod_runtime_manifests')) {
+      const now = '2026-08-20T00:00:00.000Z';
+      this.row = {
+        runtime_id: values[0], sandbox_user_id: values[1], session_id: values[2], pod_generation: values[3],
+        harness: values[4], state: 'provisioning', image_digest: values[5], container_name: values[6],
+        workspace_path: values[7], home_path: values[8], credential_version: values[9], source_repo: values[10],
+        source_branch: values[11], created_at: now, updated_at: now, stopped_at: null, failure_code: null,
+      };
+      return { rows: [this.row] as Row[] };
+    }
+    if (text.includes('SELECT runtime_id, sandbox_user_id')) {
+      return { rows: this.row ? [this.row as Row] : [] };
+    }
+    if (text.includes('UPDATE sandbox_pod_runtime_manifests')) {
+      if (!this.row) return { rows: [] as Row[], rowCount: 0 };
+      const state = String(values[1]);
+      this.row.state = state;
+      this.row.failure_code = values[2] ?? null;
+      this.row.stopped_at = state === 'stopped' || state === 'failed' ? (this.row.stopped_at ?? '2026-08-20T00:00:01.000Z') : null;
+      this.row.updated_at = '2026-08-20T00:00:01.000Z';
+      return { rows: [this.row as Row], rowCount: 1 };
+    }
+    throw new Error(`unexpected runtime query ${text}`);
   }
 }

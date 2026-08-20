@@ -304,14 +304,21 @@ function boolValue(raw: unknown, fallback = false): boolean {
   return typeof raw === 'boolean' ? raw : raw === 't' ? true : raw === 'f' ? false : fallback;
 }
 
+function positiveGeneration(raw: unknown, name: string): number {
+  const generation = Number(raw);
+  if (!Number.isSafeInteger(generation) || generation < 1) {
+    throw new TypeError(`${name} must be a positive integer`);
+  }
+  return generation;
+}
+
 function parseUser(row: Record<string, unknown>): SandboxUserRow {
   return {
     sandboxUserId: String(row.sandbox_user_id),
     enabled: boolValue(row.enabled),
     canOpenMemory: boolValue(row.can_openmemory),
     executionMode: row.execution_mode === 'native' ? 'native' : 'podman',
-    podGeneration: Number.isSafeInteger(Number(row.pod_generation)) && Number(row.pod_generation) > 0
-      ? Number(row.pod_generation) : 1,
+    podGeneration: positiveGeneration(row.pod_generation, 'sandbox user pod_generation'),
     createdAt: dateValue(row.created_at),
     updatedAt: dateValue(row.updated_at),
   };
@@ -358,8 +365,7 @@ function parseRuntime(row: Record<string, unknown>): SandboxPodRuntimeManifest {
     runtimeId: String(row.runtime_id),
     sandboxUserId: String(row.sandbox_user_id),
     sessionId: String(row.session_id),
-    podGeneration: Number.isSafeInteger(Number(row.pod_generation)) && Number(row.pod_generation) > 0
-      ? Number(row.pod_generation) : 1,
+    podGeneration: positiveGeneration(row.pod_generation, 'sandbox runtime pod_generation'),
     harness: harnessValue(String(row.harness)),
     state: stateValue(row.state),
     imageDigest: String(row.image_digest),

@@ -28,9 +28,31 @@ function dbWithPrincipal(): SqlPool {
       if (text.includes('SELECT enabled FROM agent_principals')) {
         return { rows: [{ enabled: true }] as Row[] };
       }
+      if (text.includes('FROM agent_principal_skills')) {
+        return { rows: [] as Row[] };
+      }
       throw new Error(`unexpected query ${text}`);
     },
-    connect: async () => { throw new Error('stable path must not open a legacy credential transaction'); },
+    connect: async () => ({
+      query: async <Row = Record<string, unknown>>(text: string): Promise<{ rows: Row[] }> => {
+        if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') return { rows: [] as Row[] };
+        if (text.includes('INSERT INTO agent_principals')) return { rows: [] as Row[] };
+        if (text.includes('INSERT INTO agent_principal_skills')) return { rows: [] as Row[] };
+        throw new Error(`unexpected transaction query ${text}`);
+      },
+      release: () => undefined,
+    }),
+  };
+}
+
+function dbStableOnly(): SqlPool {
+  const base = dbWithPrincipal();
+  return {
+    query: async <Row = Record<string, unknown>>(text: string): Promise<{ rows: Row[] }> => {
+      if (text.includes('FROM agent_principal_skills')) return { rows: [] as Row[] };
+      throw new Error(`legacy principal projection must not be queried: ${text}`);
+    },
+    connect: base.connect,
   };
 }
 
@@ -84,6 +106,15 @@ describe('V4 stable user principal boundary', () => {
     expect(resolved.principalBinding.sandboxUserId).toBe('guest-a');
     expect(resolved.principalBinding.podGeneration).toBe(7);
     expect(resolved.principalBinding.credentialKind).toBe('api');
+    expect(registry.calls).toContain('read:claude-code');
+  });
+
+  it('starts a stable-only identity without a legacy agent_principals row', async () => {
+    const registry = stableRegistry();
+    const repository = new AgentPrincipalRepository(dbStableOnly(), Buffer.alloc(32, 1), registry);
+    const resolved = await repository.resolveForNewInstance({ key, cliId: 'claude-code', ownerOpenId: key.openId });
+    expect(resolved.principalBinding.sandboxUserId).toBe('guest-a');
+    expect(resolved.principalSkills).toEqual([]);
     expect(registry.calls).toContain('read:claude-code');
   });
 

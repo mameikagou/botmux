@@ -442,6 +442,33 @@ export class AgentPrincipalRepository {
     return this.stableRegistry.resolveUserForIdentity(key);
   }
 
+  /**
+   * Keep the app/open projection available for the non-secret skill alias
+   * table. The stable registry remains authoritative for identity, posture,
+   * credentials and pod generation; this row is only a compatibility FK for
+   * the existing skill store and old dashboard queries.
+   */
+  private async ensureStablePrincipalProjection(
+    key: AgentPrincipalKey,
+    stable: { readonly user: SandboxUserRow; readonly identity: SandboxUserIdentityRow },
+  ): Promise<void> {
+    const [appId, openId] = keyValues(key);
+    await withAgentPrincipalTransaction(this.db, async tx => {
+      await tx.query(
+        `INSERT INTO agent_principals
+           (lark_app_id, open_id, enabled, can_openmemory, execution_mode)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (lark_app_id, open_id) DO UPDATE SET
+           enabled = EXCLUDED.enabled,
+           can_openmemory = EXCLUDED.can_openmemory,
+           execution_mode = EXCLUDED.execution_mode,
+           updated_at = now()`,
+        [appId, openId, stable.user.enabled && stable.identity.enabled,
+          stable.user.canOpenMemory, stable.user.executionMode],
+      );
+    });
+  }
+
   private static harnessForCli(cliId: string): SandboxUserHarness {
     if (cliId === 'codex') return 'codex';
     if (cliId === 'claude-code') return 'claude-code';
@@ -567,6 +594,7 @@ export class AgentPrincipalRepository {
           if (input.ownerOpenId && input.ownerOpenId !== principal.openId) {
             throw new AgentPrincipalLookupError('disabled', 'session owner does not match the requesting principal');
           }
+          await this.ensureStablePrincipalProjection(key, stable);
           return {
             principal,
             executionMode: principal.executionMode,
@@ -613,6 +641,91 @@ export class AgentPrincipalRepository {
   }): Promise<{ principal: AgentPrincipalRow; credential: AgentCredentialRecord; principalBinding: FrozenPrincipalBinding; credentialBinding: FrozenCredentialBinding; credentialSecret: string; principalSkills: readonly FrozenPrincipalSkillBinding[] }> {
     const key = { larkAppId: textKey(input.key.larkAppId, 'larkAppId'), openId: textKey(input.key.openId, 'openId') };
     const [appId, openId] = keyValues(key);
+
+    // Resolve V4 first. A stable identity is allowed to be brand new and
+    // therefore may not have an app/open compatibility row yet. The old
+    // projection is created only for the skill alias FK; it is never used as
+    // the source of credentials or pod identity.
+    if (this.stableRegistry) {
+      let stable: { user: SandboxUserRow; identity: SandboxUserIdentityRow } | undefined;
+      try {
+        stable = await this.resolveStableUser(key);
+      } catch (error) {
+        if ((error as { code?: unknown } | undefined)?.code !== 'not_found') throw error;
+      }
+      if (stable) {
+        if (input.sandboxUserId !== undefined && stable.user.sandboxUserId !== input.sandboxUserId) {
+          throw new AgentPrincipalLookupError('credential_incompatible', 'cold session sandbox user binding changed');
+        }
+        if (!stable.user.enabled || !stable.identity.enabled) {
+          throw new AgentPrincipalLookupError('disabled', 'sandbox user identity is disabled');
+        }
+        if (input.ownerOpenId && input.ownerOpenId !== stable.identity.openId && !input.adminOverride) {
+          throw new AgentPrincipalLookupError('disabled', 'session owner does not match the requesting principal');
+        }
+        if (stable.user.executionMode !== 'podman') {
+          throw new AgentPrincipalLookupError('credential_incompatible', 'native principals do not use Podman credentials');
+        }
+        const harness = AgentPrincipalRepository.harnessForCli(input.cliId);
+        await this.ensureStablePrincipalProjection(key, stable);
+        const principalSkills = await this.getPrincipalSkills(key);
+        let stableCredential: Awaited<ReturnType<NonNullable<StableSandboxUserRegistry>['readSecret']>>;
+        try {
+          stableCredential = await this.stableRegistry.readSecret({ sandboxUserId: stable.user.sandboxUserId }, harness);
+        } catch (error) {
+          if ((error as { code?: unknown } | undefined)?.code === 'credential_missing') {
+            throw new AgentPrincipalLookupError('credential_missing', 'no compatible model credential is configured');
+          }
+          throw error;
+        }
+        try { assertCredentialCompatible(input.cliId, stableCredential.metadata.credentialKind); } catch {
+          throw new AgentPrincipalLookupError('credential_incompatible', 'model credential is incompatible with this fixed bot harness');
+        }
+        const stablePrincipal = AgentPrincipalRepository.principalFromStableUser(stable.user, stable.identity);
+        const principalBinding: FrozenPrincipalBinding = {
+          larkAppId: stable.identity.larkAppId,
+          openId: stable.identity.openId,
+          enabled: true,
+          canOpenMemory: stablePrincipal.canOpenMemory,
+          cliId: input.cliId as PodmanCliId,
+          credentialVersion: stableCredential.metadata.credentialVersion,
+          credentialKind: stableCredential.metadata.credentialKind,
+          sandboxUserId: stable.user.sandboxUserId,
+          podGeneration: stable.user.podGeneration,
+          ...(input.ownerOpenId ? { ownerOpenId: input.ownerOpenId } : {}),
+          ...(principalSkills.length > 0 ? { skills: principalSkills } : {}),
+        };
+        const credentialBinding: FrozenCredentialBinding = {
+          kind: stableCredential.metadata.credentialKind,
+          credentialVersion: stableCredential.metadata.credentialVersion,
+          ...(stableCredential.metadata.baseUrl ? { baseUrl: stableCredential.metadata.baseUrl } : {}),
+          ...(stableCredential.metadata.model ? { model: stableCredential.metadata.model } : {}),
+        };
+        const credential: AgentCredentialRecord = {
+          larkAppId: key.larkAppId,
+          openId: key.openId,
+          credentialKind: stableCredential.metadata.credentialKind,
+          ...(stableCredential.metadata.baseUrl ? { baseUrl: stableCredential.metadata.baseUrl } : {}),
+          ...(stableCredential.metadata.model ? { model: stableCredential.metadata.model } : {}),
+          credentialVersion: stableCredential.metadata.credentialVersion,
+          updatedAt: stableCredential.metadata.updatedAt,
+          // Stable credentials are decrypted only by the registry. These
+          // empty buffers preserve the old return shape without copying the
+          // ciphertext into Session or a dashboard response.
+          encryptedSecret: Buffer.alloc(0),
+          secretNonce: Buffer.alloc(0),
+        };
+        return {
+          principal: stablePrincipal,
+          credential,
+          principalBinding,
+          credentialBinding,
+          credentialSecret: stableCredential.secret,
+          principalSkills,
+        };
+      }
+    }
+
     let result: SqlResult<Record<string, unknown>>;
     try {
       result = await this.db.query<Record<string, unknown>>(
@@ -653,88 +766,11 @@ export class AgentPrincipalRepository {
       throw new AgentPrincipalLookupError('credential_incompatible', 'native principals do not use Podman credentials');
     }
 
+    // A Podman principal with the V4 registry enabled must be mapped to a
+    // stable user. Never revive an old app/open credential for an unmigrated
+    // guest; only the owner-native path may continue to use the legacy row.
     if (this.stableRegistry) {
-      // A Podman principal must have completed V4 identity migration. The old
-      // app/open credential table is intentionally not a new-instance
-      // fallback once the stable registry is wired into production.
-      let stable: { user: SandboxUserRow; identity: SandboxUserIdentityRow };
-      try {
-        stable = await this.resolveStableUser(key) as { user: SandboxUserRow; identity: SandboxUserIdentityRow };
-      } catch (error) {
-        if ((error as { code?: unknown } | undefined)?.code === 'not_found') {
-          throw new AgentPrincipalLookupError('not_found', 'sandbox user identity is not registered');
-        }
-        throw error;
-      }
-      if (!stable) throw new AgentPrincipalLookupError('not_found', 'sandbox user identity is not registered');
-      if (input.sandboxUserId !== undefined && stable.user.sandboxUserId !== input.sandboxUserId) {
-        throw new AgentPrincipalLookupError('credential_incompatible', 'cold session sandbox user binding changed');
-      }
-      if (!stable.user.enabled || !stable.identity.enabled) {
-        throw new AgentPrincipalLookupError('disabled', 'sandbox user identity is disabled');
-      }
-      if (input.ownerOpenId && input.ownerOpenId !== stable.identity.openId && !input.adminOverride) {
-        throw new AgentPrincipalLookupError('disabled', 'session owner does not match the requesting principal');
-      }
-      const harness = AgentPrincipalRepository.harnessForCli(input.cliId);
-      let stableCredential: Awaited<ReturnType<NonNullable<StableSandboxUserRegistry>['readSecret']>>;
-      try {
-        stableCredential = await this.stableRegistry.readSecret({ sandboxUserId: stable.user.sandboxUserId }, harness);
-      } catch (error) {
-        if ((error as { code?: unknown } | undefined)?.code === 'credential_missing') {
-          throw new AgentPrincipalLookupError('credential_missing', 'no compatible model credential is configured');
-        }
-        throw error;
-      }
-      if (input.ownerOpenId && input.ownerOpenId !== stable.identity.openId && !input.adminOverride) {
-        throw new AgentPrincipalLookupError('disabled', 'session owner does not match the requesting principal');
-      }
-      try { assertCredentialCompatible(input.cliId, stableCredential.metadata.credentialKind); } catch {
-        throw new AgentPrincipalLookupError('credential_incompatible', 'model credential is incompatible with this fixed bot harness');
-      }
-      const stablePrincipal = AgentPrincipalRepository.principalFromStableUser(stable.user, stable.identity);
-      const stableSkills = decodePrincipalSkills(row.principal_skills);
-      const principalBinding: FrozenPrincipalBinding = {
-        larkAppId: stable.identity.larkAppId,
-        openId: stable.identity.openId,
-        enabled: true,
-        canOpenMemory: stablePrincipal.canOpenMemory,
-        cliId: input.cliId as PodmanCliId,
-        credentialVersion: stableCredential.metadata.credentialVersion,
-        credentialKind: stableCredential.metadata.credentialKind,
-        sandboxUserId: stable.user.sandboxUserId,
-        podGeneration: stable.user.podGeneration,
-        ...(input.ownerOpenId ? { ownerOpenId: input.ownerOpenId } : {}),
-        ...(stableSkills.length > 0 ? { skills: stableSkills } : {}),
-      };
-      const credentialBinding: FrozenCredentialBinding = {
-        kind: stableCredential.metadata.credentialKind,
-        credentialVersion: stableCredential.metadata.credentialVersion,
-        ...(stableCredential.metadata.baseUrl ? { baseUrl: stableCredential.metadata.baseUrl } : {}),
-        ...(stableCredential.metadata.model ? { model: stableCredential.metadata.model } : {}),
-      };
-      const credential: AgentCredentialRecord = {
-        larkAppId: key.larkAppId,
-        openId: key.openId,
-        credentialKind: stableCredential.metadata.credentialKind,
-        ...(stableCredential.metadata.baseUrl ? { baseUrl: stableCredential.metadata.baseUrl } : {}),
-        ...(stableCredential.metadata.model ? { model: stableCredential.metadata.model } : {}),
-        credentialVersion: stableCredential.metadata.credentialVersion,
-        updatedAt: stableCredential.metadata.updatedAt,
-        // Stable credentials are decrypted only by the registry. These empty
-        // buffers preserve the old return shape without leaking/copying the
-        // ciphertext into Session or a dashboard response.
-        encryptedSecret: Buffer.alloc(0),
-        secretNonce: Buffer.alloc(0),
-      };
-      return {
-        principal: stablePrincipal,
-        credential,
-        principalBinding,
-        credentialBinding,
-        credentialSecret: stableCredential.secret,
-        principalSkills: stableSkills,
-      };
+      throw new AgentPrincipalLookupError('not_found', 'sandbox user identity is not registered');
     }
     const principalSkills = decodePrincipalSkills(row.principal_skills);
     if (!row.credential_kind || row.encrypted_secret === undefined || row.secret_nonce === undefined) {
