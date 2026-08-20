@@ -55,6 +55,14 @@ import {
   PODMAN_CONTAINER_PIDS_LIMIT,
   type PodmanResourceLease,
 } from './podman-resource-admission.js';
+import {
+  DEFAULT_GUEST_PROXY,
+  createPodmanUserPodManager,
+  type PodmanPodBinding,
+  type PodmanGuestProxy,
+  type PodmanUserPodManager,
+  type PodmanUserPodManagerOptions,
+} from './podman-user-pod.js';
 
 const CONTAINER_HOME = '/home/dev';
 const CONTAINER_WORKSPACE = '/workspace';
@@ -94,6 +102,10 @@ export interface PrincipalBinding {
   readonly credentialKind?: string;
   readonly credentialVersion?: number;
   readonly ownerOpenId?: string;
+  /** Stable principal-authority ID used to group guest sessions into one pod. */
+  readonly sandboxUserId?: string;
+  /** Frozen user-pod generation; missing keeps the pre-v4 single-container path. */
+  readonly podGeneration?: number;
   /** Explicit skill leaves snapshotted at new-topic ingress. */
   readonly skills?: readonly FrozenPrincipalSkillBinding[];
 }
@@ -118,6 +130,9 @@ export interface PodmanPrepareInput {
   readonly expectedOwnerOpenId?: string;
   readonly principalBinding?: PrincipalBinding;
   readonly credentialBinding?: CredentialBinding;
+  /** V4 per-user pod identity. Both fields are frozen at new-topic ingress. */
+  readonly sandboxUserId?: string;
+  readonly podGeneration?: number;
   /** Transient owner-only capability; never persisted in Session. */
   readonly memoryGateCapability?: string;
 }
@@ -157,6 +172,8 @@ export interface PreparedExecution {
   readonly hostUid: number;
   readonly hostGid: number;
   readonly principalSkills: readonly FrozenPrincipalSkillBinding[];
+  /** V4 is present only when the caller supplied the frozen user-pod binding. */
+  readonly userPod?: PodmanPodBinding;
 }
 export type PreparedPodmanExecution = PreparedExecution;
 
@@ -214,6 +231,10 @@ export interface PodmanExecutionProviderOptions {
   readonly hostGid?: number;
   /** Minimal host environment used by the Podman client itself. */
   readonly hostEnv?: Readonly<Record<string, string | undefined>>;
+  /** Test seam and narrow integration point for the V4 pod authority. */
+  readonly userPodManager?: PodmanUserPodManager;
+  readonly userPodManagerOptions?: PodmanUserPodManagerOptions;
+  readonly guestProxy?: PodmanGuestProxy;
 }
 
 function fail(message: string): never {
@@ -562,6 +583,23 @@ function assertPrepared(prepared: PreparedExecution, expectedConfig?: PodmanExec
   if (JSON.stringify(expectedMounts) !== JSON.stringify(prepared.mounts)) fail('prepared mounts do not match the T4 allow-list');
   const expectedNetwork = buildPastaNetworkPlan(prepared.network.canOpenMemory);
   if (JSON.stringify(expectedNetwork) !== JSON.stringify(prepared.network)) fail('prepared network does not match the T4 allow-list');
+  if (prepared.userPod) {
+    if (prepared.userPod.networkProfile !== (prepared.network.canOpenMemory ? 'owner-memory' : 'guest')) {
+      fail('prepared user pod does not match the frozen network profile');
+    }
+    const expectedUserPod = createPodmanUserPodManager(config.runtimeRoot).binding({
+      larkAppId: prepared.userPod.larkAppId,
+      sandboxUserId: prepared.userPod.sandboxUserId,
+      podGeneration: prepared.userPod.podGeneration,
+      canOpenMemory: prepared.network.canOpenMemory,
+    });
+    const { guestProxy: _expectedProxy, ...expectedWithoutProxy } = expectedUserPod;
+    const { guestProxy: actualProxy, ...actualWithoutProxy } = prepared.userPod;
+    if (JSON.stringify(expectedWithoutProxy) !== JSON.stringify(actualWithoutProxy)
+      || (actualProxy !== undefined && actualProxy.selectedRoute !== 'USA-08')) {
+      fail('prepared user pod is not canonical');
+    }
+  }
   if (prepared.network.canOpenMemory) {
     if (!prepared.memoryGate
       || prepared.memoryGate.mcp.url !== MEMORY_GATE_URL
@@ -643,6 +681,8 @@ export class PodmanExecutionProvider {
   private readonly hostGid: number;
   private readonly hostEnv: Readonly<Record<string, string>>;
   private readonly resourceLeases = new Map<string, PodmanResourceLease>();
+  private readonly userPodManager: PodmanUserPodManager;
+  private readonly userPodLeases = new Map<string, () => void>();
 
   constructor(config: PodmanExecutionConfig, options: PodmanExecutionProviderOptions = {}) {
     this.config = canonicalPreparedConfig(config);
@@ -673,6 +713,17 @@ export class PodmanExecutionProvider {
       if (typeof value === 'string' && value.length > 0) clientEnv[key] = value;
     }
     this.hostEnv = clientEnv;
+    const managerOptions = options.userPodManagerOptions ?? {};
+    this.userPodManager = options.userPodManager ?? createPodmanUserPodManager(
+      this.config.runtimeRoot,
+      {
+        ...managerOptions,
+        hostEnv: managerOptions.hostEnv ?? inheritedHostEnv,
+        // Every guest pod receives the host-owned fixed route. Owner-memory
+        // bindings remain unproxied in PodmanUserPodManager.binding().
+        guestProxy: managerOptions.guestProxy ?? options.guestProxy ?? DEFAULT_GUEST_PROXY,
+      },
+    );
   }
 
   async prepare(input: PodmanPrepareInput): Promise<PreparedExecution> {
@@ -704,6 +755,11 @@ export class PodmanExecutionProvider {
       fail('owner OpenMemory execution requires an explicitly enabled principal');
     }
     const runtime = buildSessionRuntimePaths(this.config, principal, sessionId);
+    const sandboxUserId = input.sandboxUserId ?? input.principalBinding?.sandboxUserId;
+    const podGeneration = input.podGeneration ?? input.principalBinding?.podGeneration;
+    if ((sandboxUserId === undefined) !== (podGeneration === undefined)) {
+      fail('sandboxUserId and podGeneration must be supplied together');
+    }
     const lockKey = `${this.config.runtimeRoot}/${runtime.principalHash}/${runtime.sessionHash}`;
     const previous = prepareLocks.get(lockKey) ?? Promise.resolve(undefined as unknown as PreparedExecution);
     const current = previous.then(async () => {
@@ -719,6 +775,14 @@ export class PodmanExecutionProvider {
       });
       const mounts = buildPodmanMountPlan(this.config, runtime, credential, principalSkills);
       const network = buildPastaNetworkPlan(principal.canOpenMemory);
+      const userPod = sandboxUserId !== undefined && podGeneration !== undefined
+        ? this.userPodManager.binding({
+          larkAppId: principal.larkAppId,
+          sandboxUserId,
+          podGeneration,
+          canOpenMemory: principal.canOpenMemory,
+        })
+        : undefined;
       const memoryGate = principal.canOpenMemory
         ? buildOwnerMemoryGatePlanFromCapability({
             principal: {
@@ -802,6 +866,12 @@ export class PodmanExecutionProvider {
         // friend instance cannot retain a stale owner URL/token.
         removeMemoryMcpConfig(runtime.homeRoot, cliId, credential.providerConfig === undefined);
       }
+      if (userPod) {
+        // Pod creation is serialized by the manager's cross-process lock. The
+        // session files below remain independent bind mounts; the pod is only
+        // the shared network/process namespace.
+        await this.userPodManager.ensure(userPod, network);
+      }
       const prepared: PreparedExecution = {
         config: this.config,
         sessionId,
@@ -824,6 +894,7 @@ export class PodmanExecutionProvider {
         hostUid: this.hostUid,
         hostGid: this.hostGid,
         principalSkills,
+        ...(userPod ? { userPod } : {}),
       };
       assertPrepared(prepared, this.config);
       return prepared;
@@ -1006,6 +1077,24 @@ export class PodmanExecutionProvider {
       containerEnv.AGENT_BASE_URL = prepared.credential.providerConfig.baseUrl;
       containerEnv.AGENT_MODEL = prepared.credential.providerConfig.model;
     }
+    if (prepared.userPod?.guestProxy) {
+      const proxy = prepared.userPod.guestProxy;
+      const proxyUrl = `http://${proxy.host}:${String(proxy.httpPort)}`;
+      const allProxyUrl = proxy.socksPort === undefined
+        ? proxyUrl
+        : `socks5h://${proxy.host}:${String(proxy.socksPort)}`;
+      // Proxy routing is a pod capability, not a user credential. Keep the
+      // endpoint in argv as a non-secret value; Clash/Mihomo remains the only
+      // place that knows or changes the USA-08 upstream selection.
+      containerEnv.HTTP_PROXY = proxyUrl;
+      containerEnv.HTTPS_PROXY = proxyUrl;
+      containerEnv.ALL_PROXY = allProxyUrl;
+      containerEnv.NO_PROXY = '127.0.0.1,localhost,::1,host.containers.internal,host.docker.internal';
+      containerEnv.http_proxy = proxyUrl;
+      containerEnv.https_proxy = proxyUrl;
+      containerEnv.all_proxy = allProxyUrl;
+      containerEnv.no_proxy = containerEnv.NO_PROXY;
+    }
     if (prepared.credential.credentialKind === 'api') {
       // The T2 entrypoint consumes this generic triplet and aliases it to the
       // selected harness. Keep the legacy per-harness values too; they are
@@ -1049,8 +1138,12 @@ export class PodmanExecutionProvider {
       '--tty',
       '--userns=keep-id',
       `--user=${prepared.hostUid}:${prepared.hostGid}`,
-      `--network=${prepared.network.networkOption}`,
-      ...prepared.network.addHosts.map(host => `--add-host=${host}`),
+      ...(prepared.userPod
+        ? [`--pod=${prepared.userPod.podName}`]
+        : [
+            `--network=${prepared.network.networkOption}`,
+            ...prepared.network.addHosts.map(host => `--add-host=${host}`),
+          ]),
       '--cap-drop=ALL',
       '--security-opt=no-new-privileges',
       `--pids-limit=${String(PODMAN_CONTAINER_PIDS_LIMIT)}`,
@@ -1061,6 +1154,7 @@ export class PodmanExecutionProvider {
       '--tmpfs=/tmp:rw,nosuid,nodev',
       '--label=io.botmux.managed=true',
       `--label=io.botmux.session=${prepared.runtime.sessionHash}`,
+      ...(prepared.userPod ? [`--label=io.botmux.pod=${prepared.userPod.podName}`] : []),
       `--label=io.botmux.resource.memory-bytes=${String(podmanMemoryBytes(prepared.config.memory))}`,
       `--label=io.botmux.resource.cpus=${String(prepared.config.cpus)}`,
       `--name=${prepared.runtime.containerName}`,
@@ -1074,13 +1168,24 @@ export class PodmanExecutionProvider {
       args.push(secretKeys.has(key) ? `--env=${key}` : `--env=${key}=${value}`);
     }
     args.push(prepared.config.image, '--', ...cliArgs);
-    const resourceLease = acquirePodmanResourceLease(
-      this.config.runtimeRoot,
-      prepared.runtime.sessionHash,
-      podmanMemoryBytes(prepared.config.memory),
-      prepared.config.cpus,
-    );
-    this.resourceLeases.set(prepared.runtime.sessionRoot, resourceLease);
+    let userPodRelease: (() => void) | undefined;
+    try {
+      if (prepared.userPod) {
+        userPodRelease = this.userPodManager.acquireSession(prepared.userPod, prepared.runtime.sessionHash);
+        this.userPodLeases.set(prepared.runtime.sessionRoot, userPodRelease);
+      }
+      const resourceLease = acquirePodmanResourceLease(
+        this.config.runtimeRoot,
+        prepared.runtime.sessionHash,
+        podmanMemoryBytes(prepared.config.memory),
+        prepared.config.cpus,
+      );
+      this.resourceLeases.set(prepared.runtime.sessionRoot, resourceLease);
+    } catch (error) {
+      userPodRelease?.();
+      this.userPodLeases.delete(prepared.runtime.sessionRoot);
+      throw error;
+    }
     const releaseResource = (): void => this.releaseResource(prepared);
     // The secret is intentionally absent from args. Callers must use env as
     // the child environment when spawning this exact Podman argv.
@@ -1180,9 +1285,34 @@ export class PodmanExecutionProvider {
 
   private releaseResource(prepared: PreparedExecution): void {
     const lease = this.resourceLeases.get(prepared.runtime.sessionRoot);
-    if (!lease) return;
-    this.resourceLeases.delete(prepared.runtime.sessionRoot);
-    lease.release();
+    if (lease) {
+      this.resourceLeases.delete(prepared.runtime.sessionRoot);
+      lease.release();
+    }
+    const userPodLease = this.userPodLeases.get(prepared.runtime.sessionRoot);
+    if (userPodLease) {
+      this.userPodLeases.delete(prepared.runtime.sessionRoot);
+      userPodLease();
+      // Do not leave an idle infra pod running after the last worker exits.
+      // Its metadata and every session directory remain for a cold restart.
+      if (prepared.userPod) this.userPodManager.stopIfIdleSync(prepared.userPod);
+    }
+  }
+
+  /** Explicit user-pod lifecycle controls used by the host/session reaper. */
+  async inspectUserPod(prepared: PreparedExecution): Promise<import('./podman-user-pod.js').PodmanPodState | undefined> {
+    assertPrepared(prepared, this.config);
+    return prepared.userPod ? this.userPodManager.inspect(prepared.userPod) : undefined;
+  }
+
+  async removeUserPod(
+    prepared: PreparedExecution,
+    authorization?: { readonly authorized: true; readonly force?: boolean },
+  ): Promise<void> {
+    assertPrepared(prepared, this.config);
+    if (!prepared.userPod) return;
+    if (!authorization?.authorized) fail('removeUserPod requires explicit authorized:true');
+    await this.userPodManager.remove(prepared.userPod, { force: authorization.force === true });
   }
 }
 

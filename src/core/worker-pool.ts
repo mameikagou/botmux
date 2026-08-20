@@ -6926,6 +6926,8 @@ export function forkWorker(
     persistentBackendTarget: ds.session.persistentBackendTarget,
     backendConfig: botCfg.riff,
     ...(podmanExecution ? { execution: podmanExecution } : {}),
+    ...(podmanExecution && ds.session.sandboxUserId ? { sandboxUserId: ds.session.sandboxUserId } : {}),
+    ...(podmanExecution && ds.session.podGeneration !== undefined ? { podGeneration: ds.session.podGeneration } : {}),
     ...(ds.session.principalBinding ? { principalBinding: ds.session.principalBinding } : {}),
     ...((ds.session.principalSkills ?? ds.session.principalBinding?.skills)
       ? { principalSkills: [...(ds.session.principalSkills ?? ds.session.principalBinding?.skills ?? [])] }

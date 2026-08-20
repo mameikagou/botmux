@@ -1,4 +1,5 @@
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
@@ -119,6 +120,97 @@ describe('PodmanExecutionProvider', () => {
     expect(readlinkSync(join(first.hostWorkingDir, 'apps/quant-qlib/knowledge/investment-books')))
       .toBe('/knowledge/investment-books');
     expect(first.network.networkOption).toBe('pasta:--no-map-gw');
+  });
+
+  it('joins a frozen sandbox user pod and injects only the host proxy endpoint', async () => {
+    const fixture = makeFixture();
+    const calls: string[][] = [];
+    let podExists = false;
+    const podRunner: PodmanCommandRunner = (command, args, options) => {
+      if (command !== 'podman') return fakeRunner(calls)(command, args, options);
+      calls.push([command, ...args]);
+      if (args[0] === 'pod' && args[1] === 'inspect') {
+        if (!podExists) return { status: 1, stdout: '', stderr: 'no such pod' };
+        const podName = args[args.length - 1]!;
+        return {
+          status: 0,
+          stdout: JSON.stringify({
+            Id: 'pod-cid',
+            State: { Status: 'Running' },
+            Config: { Labels: {
+              'io.botmux.managed': 'true',
+              'io.botmux.sandbox-user-hash': preparedHash,
+              'io.botmux.pod-generation': '4',
+              'io.botmux.network-profile': 'guest',
+              'io.botmux.proxy-route': 'USA-08',
+            } },
+          }),
+          stderr: '',
+        };
+      }
+      if (args[0] === 'pod' && args[1] === 'create') {
+        podExists = true;
+        return { status: 0, stdout: '', stderr: '' };
+      }
+      if (args[0] === 'pod' && (args[1] === 'stop' || args[1] === 'start')) {
+        return { status: 0, stdout: '', stderr: '' };
+      }
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    // The hash is intentionally calculated by the lifecycle manager's stable
+    // sandbox-user identity, not by app-scoped open_id.
+    const preparedHash = createHash('sha256').update('stable-user').digest('hex').slice(0, 24);
+    const provider = new PodmanExecutionProvider(fixture.config, {
+      commandRunner: podRunner,
+      checkImage: false,
+      hostUid: 1000,
+      hostGid: 1000,
+      userPodManagerOptions: {
+        commandRunner: podRunner,
+        syncCommandRunner: () => undefined,
+        verifyGuestProxy: false,
+        hostEnv: { PATH: '/usr/bin' },
+      },
+    });
+    const prepared = await provider.prepare({
+      sessionId: 'user-pod-provider',
+      cliId: 'claude-code',
+      sandboxUserId: 'stable-user',
+      podGeneration: 4,
+      principalBinding: { larkAppId: 'cli_test', openId: 'ou_test', enabled: true },
+      credentialBinding: {
+        kind: 'api',
+        version: 1,
+        baseUrl: 'https://api.example.com/v1',
+        model: 'claude-test',
+      },
+    });
+    expect(prepared.userPod?.podName).toBe(`botmux-user-${preparedHash}-g4`);
+    const launch = provider.launch(prepared, {
+      cliId: 'claude-code',
+      bin: 'claude',
+      args: ['--version'],
+      credentialSecret: 'api-secret-0123456789abcdef0123456789',
+    });
+    expect(launch.args).toContain(`--pod=${prepared.userPod?.podName}`);
+    expect(launch.args.some(arg => arg.startsWith('--network='))).toBe(false);
+    expect(prepared.userPod?.guestProxy).toMatchObject({
+      host: '169.254.1.1', httpPort: 17890, socksPort: 17890, selectedRoute: 'USA-08',
+    });
+    expect(launch.args).toContain('--env=HTTP_PROXY=http://169.254.1.1:17890');
+    expect(launch.args).toContain('--env=HTTPS_PROXY=http://169.254.1.1:17890');
+    expect(launch.args).toContain('--env=ALL_PROXY=socks5h://169.254.1.1:17890');
+    expect(launch.args).toContain('--env=NO_PROXY=127.0.0.1,localhost,::1,host.containers.internal,host.docker.internal');
+    expect(launch.args).toContain('--env=http_proxy=http://169.254.1.1:17890');
+    expect(launch.args).toContain('--env=https_proxy=http://169.254.1.1:17890');
+    expect(launch.args).toContain('--env=all_proxy=socks5h://169.254.1.1:17890');
+    expect(launch.args).toContain('--env=no_proxy=127.0.0.1,localhost,::1,host.containers.internal,host.docker.internal');
+    expect(launch.args.join('\n')).not.toContain('config.yaml');
+    expect(launch.args.join('\n')).not.toContain(':7890');
+    const podCreate = calls.find(call => call[0] === 'podman' && call[1] === 'pod' && call[2] === 'create');
+    expect(podCreate).toContain('--network=pasta:-T,none,-U,none,--map-host-loopback,169.254.1.1');
+    expect(podCreate?.join('\n')).not.toContain(':7890');
+    await provider.stop(prepared);
   });
 
   it('emits fixed Podman argv, exact T4 mounts, and keeps API secrets out of argv/files', async () => {

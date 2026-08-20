@@ -11506,6 +11506,8 @@ async function spawnCli(
       expectedOwnerOpenId: cfg.ownerOpenId,
       principalBinding: cfg.principalBinding,
       credentialBinding: cfg.credentialBinding,
+      sandboxUserId: cfg.sandboxUserId,
+      podGeneration: cfg.podGeneration,
       memoryGateCapability: cfg.memoryGateCapability,
     });
     // Construct lazily on the first T3 request so a worker can still boot

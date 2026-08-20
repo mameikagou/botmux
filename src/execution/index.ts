@@ -1,5 +1,6 @@
 export * from './podman-execution.js';
 export * from './podman-provider.js';
+export * from './podman-user-pod.js';
 export * from '../services/agent-principal-store.js';
 export * from '../services/agent-principal-crypto.js';
 export * from '../services/agent-credential-policy.js';
