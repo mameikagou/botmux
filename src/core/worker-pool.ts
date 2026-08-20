@@ -73,6 +73,7 @@ import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from '../services/feedback-policy-resolver.js';
 import { assertPodmanPrincipalReadyForFork } from './agent-principal-runtime.js';
+import type { PodmanExecutionConfig } from '../execution/podman-execution.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
  *  isolated persistent panes so a suspend→resume reattach (same id) is
@@ -6187,6 +6188,16 @@ export function resolveQuarantinedForkPlan(
   };
 }
 
+/** Resolve the frozen launch profile used by the worker fork boundary. A
+ * native mode always wins over a pre-seeded or live Podman candidate. */
+export function podmanExecutionForSession(
+  session: Pick<Session, 'executionMode' | 'execution'>,
+  botExecution?: PodmanExecutionConfig,
+): PodmanExecutionConfig | undefined {
+  if (session.executionMode === 'native') return undefined;
+  return session.execution ?? botExecution;
+}
+
 /**
  * Fork (or re-attach) a worker for `ds`.
  *
@@ -6368,9 +6379,7 @@ export function forkWorker(
   // A native principal is an explicit frozen host-execution decision. Never
   // fall back to the live bot's Podman profile for a native session during a
   // restart or cold restore.
-  const podmanExecution = ds.session.executionMode === 'native'
-    ? undefined
-    : ds.session.execution ?? botCfg.execution;
+  const podmanExecution = podmanExecutionForSession(ds.session, botCfg.execution);
   if (podmanExecution) {
     // All async cold-start call sites hydrate the principal before reaching
     // this synchronous fork boundary. Keep this invariant here as a final

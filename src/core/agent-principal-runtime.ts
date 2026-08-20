@@ -139,7 +139,11 @@ export async function ensureSandboxPrincipalForFork(input: {
   // owns the frozen binding and must never trigger a per-message DB lookup.
   if (ds.worker && !ds.worker.killed) return;
   const principalRepository = input.repository ?? getRepository();
-  if (!ds.session.executionMode && !ds.session.execution && !ds.session.principalBinding && !ds.session.credentialBinding) {
+  // Some creation paths pre-seed Session.execution from the live bot config
+  // before this async boundary runs. That value is only a candidate profile,
+  // not a frozen decision; the mode/binding fields are the authoritative
+  // new-instance marker.
+  if (!ds.session.executionMode && !ds.session.principalBinding && !ds.session.credentialBinding) {
     const openId = ds.ownerOpenId ?? ds.session.ownerOpenId;
     if (!openId) throw new Error('a sandbox session requires an app-scoped owner open_id');
     const mode = await principalRepository.resolveExecutionModeForNewInstance({
@@ -147,6 +151,11 @@ export async function ensureSandboxPrincipalForFork(input: {
       ownerOpenId: openId,
     });
     ds.session.executionMode = mode.executionMode;
+    if (mode.executionMode === 'native') {
+      // Remove a pre-seeded Podman profile before persisting the native freeze;
+      // forkWorker must not be able to recover it on a cold restart.
+      ds.session.execution = undefined;
+    }
     input.persist?.(ds.session);
     if (mode.executionMode === 'native') return;
   } else if (!ds.session.executionMode) {

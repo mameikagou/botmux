@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { ensureSandboxPrincipalForFork } from '../src/core/agent-principal-runtime.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { handleAgentCredentialsApi } from '../src/dashboard/agent-credentials-api.js';
+import { podmanExecutionForSession } from '../src/core/worker-pool.js';
 
 function daemonSession(): DaemonSession {
   return {
@@ -34,6 +35,9 @@ function daemonSession(): DaemonSession {
 describe('principal execution mode boundary', () => {
   it('freezes native mode once and never falls back to the bot Podman profile', async () => {
     const ds = daemonSession();
+    // session-manager may pre-seed the candidate profile before the principal
+    // boundary resolves the app-scoped execution mode.
+    ds.session.execution = { type: 'podman' } as any;
     let modeLookups = 0;
     let credentialLookups = 0;
     const persisted: string[] = [];
@@ -60,6 +64,7 @@ describe('principal execution mode boundary', () => {
     });
     expect(ds.session.executionMode).toBe('native');
     expect(ds.session.execution).toBeUndefined();
+    expect(podmanExecutionForSession(ds.session, execution)).toBeUndefined();
     expect(modeLookups).toBe(1);
     expect(credentialLookups).toBe(0);
 
