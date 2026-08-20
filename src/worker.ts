@@ -318,6 +318,12 @@ import { hookCommandFor } from './adapters/hook-command.js';
 import { findOnlineDaemon, parseDaemonIpcPort } from './utils/daemon-discovery.js';
 import { fetchDaemonIpc } from './core/daemon-ipc-auth.js';
 import { withCodexAppContext } from './utils/codex-app-context.js';
+import {
+  applyNativeOwnerRuntime,
+  BOTMUX_CAN_OPENMEMORY_ENV,
+  BOTMUX_EXECUTION_MODE_ENV,
+} from './core/native-owner-runtime.js';
+import { MEMORY_GATE_CAPABILITY_ENV } from './services/openmemory-memory-gate.js';
 import { resolveCodexAppFinalTurnIdentity } from './adapters/cli/codex-app-turn.js';
 import { RunnerControlDecoder } from './adapters/cli/runner-control-channel.js';
 import {
@@ -12885,6 +12891,23 @@ async function spawnCli(
     );
     ensureManagedOriginCapabilityLeafSafe(readIsolationOriginCapabilityFile);
     publishSandboxRelayCapability({ failClosed: true });
+  }
+
+  applyNativeOwnerRuntime({
+    cliId: cfg.cliId,
+    executionMode: cfg.executionMode,
+    ownerCanOpenMemory: cfg.ownerCanOpenMemory,
+    memoryGateCapability: cfg.memoryGateCapability,
+    args,
+    env: childEnv,
+  });
+  // spawnEnv is intentionally a separate launch snapshot. Mirror only these
+  // host-decided runtime keys so PTY and persistent backends receive the same
+  // owner posture without widening the environment behavior of legacy paths.
+  for (const key of [BOTMUX_EXECUTION_MODE_ENV, BOTMUX_CAN_OPENMEMORY_ENV, MEMORY_GATE_CAPABILITY_ENV]) {
+    const value = childEnv[key];
+    if (value === undefined) delete spawnEnv[key];
+    else spawnEnv[key] = value;
   }
 
   // Per-bot env (bots.json `env`): extra vars for THIS bot's CLI only — e.g.

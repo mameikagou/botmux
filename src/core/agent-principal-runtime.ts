@@ -19,6 +19,8 @@ import { principalHash, sessionHash } from '../execution/podman-execution.js';
 
 let repository: AgentPrincipalRepository | undefined;
 let repositoryMigration: Promise<void> | undefined;
+const MEMORY_GATE_STARTUP_ATTEMPTS = 6;
+const MEMORY_GATE_STARTUP_RETRY_MS = 500;
 
 function getRepository(): AgentPrincipalRepository {
   if (repository) return repository;
@@ -39,6 +41,16 @@ async function getRepositoryReady(): Promise<AgentPrincipalRepository> {
   const value = getRepository();
   await repositoryMigration;
   return value;
+}
+
+async function waitForMemoryGateReadiness(secret: string): Promise<boolean> {
+  for (let attempt = 0; attempt < MEMORY_GATE_STARTUP_ATTEMPTS; attempt += 1) {
+    if (await probeMemoryGateReadiness({ secret })) return true;
+    if (attempt + 1 < MEMORY_GATE_STARTUP_ATTEMPTS) {
+      await new Promise(resolve => setTimeout(resolve, MEMORY_GATE_STARTUP_RETRY_MS));
+    }
+  }
+  return false;
 }
 
 function materializeCodexCredential(input: {
@@ -108,21 +120,23 @@ export function assertPodmanPrincipalReadyForFork(input: {
 async function prepareOwnerMemoryCapability(ds: DaemonSession, cliId: string): Promise<void> {
   const binding = ds.session.principalBinding;
   ds.memoryGateCapability = undefined;
-  if (!binding || binding.enabled !== true || binding.canOpenMemory !== true) return;
+  const nativeOwner = ds.session.executionMode === 'native'
+    && ds.session.ownerCanOpenMemory === true;
+  if (!nativeOwner && (!binding || binding.enabled !== true || binding.canOpenMemory !== true)) return;
   if (!supportsOwnerMemoryMcp(cliId)) {
     throw new Error('owner OpenMemory MCP is unsupported by this harness');
   }
-  const openId = binding.openId ?? binding.open_id;
-  if (!openId || binding.larkAppId !== ds.larkAppId) {
+  const openId = binding?.openId ?? binding?.open_id ?? ds.ownerOpenId ?? ds.session.ownerOpenId;
+  if (!openId || (binding && binding.larkAppId !== ds.larkAppId)) {
     throw new Error('owner OpenMemory principal identity is invalid');
   }
   const secret = loadMemoryGateCapabilitySecretFromConfig();
   if (!secret) throw new Error('owner OpenMemory capability secret is not configured');
-  if (!(await probeMemoryGateReadiness({ secret }))) {
+  if (!(await waitForMemoryGateReadiness(secret))) {
     throw new Error('owner OpenMemory gate is not ready');
   }
   const plan = buildOwnerMemoryGatePlan({
-    principal: binding,
+    principal: binding ?? { enabled: true, canOpenMemory: nativeOwner },
     cliId,
     sessionHash: sessionHash(ds.larkAppId, openId, ds.session.sessionId),
     principalHash: principalHash(ds.larkAppId, openId),
@@ -146,16 +160,37 @@ export async function ensureSandboxPrincipalForFork(input: {
   readonly repository?: Pick<AgentPrincipalRepository, 'resolveExecutionModeForNewInstance' | 'resolveForNewInstance'>;
 }): Promise<void> {
   const { ds, execution, cliId } = input;
-  // Native is a durable per-session decision. Once stamped, later messages,
-  // worker restarts, and daemon cold restores must never consult the principal
-  // table again or fall back to the bot's Podman profile.
-  if (ds.session.executionMode === 'native') return;
-  if (!execution) return;
   // The daemon clears credentialSecret immediately after dispatching init, so
   // its absence alone does not mean this topic is cold. A live worker already
   // owns the frozen binding and must never trigger a per-message DB lookup.
   if (ds.worker && !ds.worker.killed) return;
-  const principalRepository = input.repository ?? await getRepositoryReady();
+  let principalRepository = input.repository;
+  const readyRepository = async () => principalRepository ??= await getRepositoryReady();
+  // Native is a durable per-session decision. Old native sessions predate the
+  // frozen capability bit, so hydrate that non-secret posture once at a cold
+  // fork. Ordinary topic messages with a live worker never query PostgreSQL.
+  if (ds.session.executionMode === 'native') {
+    if (ds.session.ownerCanOpenMemory === undefined) {
+      const openId = ds.ownerOpenId ?? ds.session.ownerOpenId;
+      if (!openId) throw new Error('a native owner session requires an app-scoped owner open_id');
+      const mode = await (await readyRepository()).resolveExecutionModeForNewInstance({
+        key: { larkAppId: ds.larkAppId, openId },
+        ownerOpenId: openId,
+      });
+      if (mode.executionMode !== 'native') {
+        throw new Error('frozen native session no longer resolves to a native principal');
+      }
+      ds.session.ownerCanOpenMemory = mode.principal.canOpenMemory === true;
+      if ((mode.principalSkills?.length ?? 0) > 0) {
+        ds.session.principalSkills = [...mode.principalSkills] as FrozenPrincipalSkillBinding[];
+      }
+      input.persist?.(ds.session);
+    }
+    await prepareOwnerMemoryCapability(ds, cliId);
+    return;
+  }
+  if (!execution) return;
+  const resolvedRepository = await readyRepository();
   // Some creation paths pre-seed Session.execution from the live bot config
   // before this async boundary runs. That value is only a candidate profile,
   // not a frozen decision; the mode/binding fields are the authoritative
@@ -163,11 +198,14 @@ export async function ensureSandboxPrincipalForFork(input: {
   if (!ds.session.executionMode && !ds.session.principalBinding && !ds.session.credentialBinding) {
     const openId = ds.ownerOpenId ?? ds.session.ownerOpenId;
     if (!openId) throw new Error('a sandbox session requires an app-scoped owner open_id');
-    const mode = await principalRepository.resolveExecutionModeForNewInstance({
+    const mode = await resolvedRepository.resolveExecutionModeForNewInstance({
       key: { larkAppId: ds.larkAppId, openId },
       ownerOpenId: openId,
     });
     ds.session.executionMode = mode.executionMode;
+    ds.session.ownerCanOpenMemory = mode.executionMode === 'native'
+      ? mode.principal.canOpenMemory === true
+      : undefined;
     if (mode.sandboxUserId !== undefined || mode.podGeneration !== undefined) {
       if (mode.sandboxUserId === undefined || mode.podGeneration === undefined) {
         throw new Error('stable sandbox pod binding is incomplete');
@@ -184,7 +222,10 @@ export async function ensureSandboxPrincipalForFork(input: {
       ds.session.execution = undefined;
     }
     input.persist?.(ds.session);
-    if (mode.executionMode === 'native') return;
+    if (mode.executionMode === 'native') {
+      await prepareOwnerMemoryCapability(ds, cliId);
+      return;
+    }
   } else if (!ds.session.executionMode) {
     // Sessions persisted by the pre-mode build are already Podman-bound when
     // they carry execution/principal material. Preserve that conservative
@@ -201,7 +242,7 @@ export async function ensureSandboxPrincipalForFork(input: {
       const resolved = await materializeColdPodmanCredential({
         ds,
         cliId,
-        repository: principalRepository,
+        repository: resolvedRepository,
         persist: input.persist ? session => input.persist?.(session) : undefined,
       });
       materializeCodexCredential({
@@ -232,7 +273,7 @@ export async function ensureSandboxPrincipalForFork(input: {
   const resolved = await bindNewPodmanSession({
     ds,
     cliId,
-    repository: principalRepository,
+    repository: resolvedRepository,
     persist: session => input.persist?.(session),
   });
   if (resolved) {

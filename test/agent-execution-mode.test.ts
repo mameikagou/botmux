@@ -119,6 +119,29 @@ describe('principal execution mode boundary', () => {
     expect(ds.credentialSecret).toBe('test-secret');
   });
 
+  it('hydrates the missing native owner capability posture only on a cold fork', async () => {
+    const ds = daemonSession();
+    ds.session.executionMode = 'native';
+    let lookups = 0;
+    const repository = {
+      resolveExecutionModeForNewInstance: async () => {
+        lookups += 1;
+        return {
+          principal: { canOpenMemory: false },
+          executionMode: 'native' as const,
+          principalSkills: [],
+        } as any;
+      },
+      resolveForNewInstance: async () => { throw new Error('not used'); },
+    };
+    await ensureSandboxPrincipalForFork({ ds, cliId: 'codex', repository });
+    expect(ds.session.ownerCanOpenMemory).toBe(false);
+    expect(lookups).toBe(1);
+
+    await ensureSandboxPrincipalForFork({ ds, cliId: 'codex', repository });
+    expect(lookups).toBe(1);
+  });
+
   it('keeps execution-mode mutation owner-only at the pairing API', async () => {
     let mode: 'native' | 'podman' = 'podman';
     const principal = {

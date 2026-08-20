@@ -253,6 +253,11 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // Session owner (standard name; `__OWNER_OPEN_ID` above is the legacy
   // channel). Custom CLI wrappers read it for per-user permission isolation.
   'BOTMUX_OWNER_OPEN_ID',
+  // Frozen execution posture used by the shared-environment skill. The memory
+  // capability is a short-lived gate token, never the upstream OM_API_KEY.
+  'BOTMUX_EXECUTION_MODE',
+  'BOTMUX_CAN_OPENMEMORY',
+  'BOTMUX_MEMORY_CAPABILITY',
   'BOTMUX_TURN_ID',
   'BOTMUX_DISPATCH_ATTEMPT',
   // Resolved display footer for sandboxed `botmux send`; avoids reading the

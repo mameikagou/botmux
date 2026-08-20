@@ -6925,6 +6925,8 @@ export function forkWorker(
     // managed-agent affinity across daemon/worker replacement.
     persistentBackendTarget: ds.session.persistentBackendTarget,
     backendConfig: botCfg.riff,
+    executionMode: ds.session.executionMode ?? (podmanExecution ? 'podman' : 'native'),
+    ownerCanOpenMemory: ds.session.ownerCanOpenMemory === true,
     ...(podmanExecution ? { execution: podmanExecution } : {}),
     ...(podmanExecution && ds.session.sandboxUserId ? { sandboxUserId: ds.session.sandboxUserId } : {}),
     ...(podmanExecution && ds.session.podGeneration !== undefined ? { podGeneration: ds.session.podGeneration } : {}),
@@ -6934,7 +6936,7 @@ export function forkWorker(
       : {}),
     ...(ds.session.credentialBinding ? { credentialBinding: ds.session.credentialBinding } : {}),
     ...(podmanExecution && ds.credentialSecret ? { credentialSecret: ds.credentialSecret } : {}),
-    ...(podmanExecution && ds.memoryGateCapability ? { memoryGateCapability: ds.memoryGateCapability } : {}),
+    ...(ds.memoryGateCapability ? { memoryGateCapability: ds.memoryGateCapability } : {}),
     riffParentTaskId: ds.session.riffParentTaskId,
     riffRepoDirs: ds.session.riffRepoDirs,
     deferredScheduleRun: ds.session.deferredScheduleRun,
