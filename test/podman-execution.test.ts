@@ -160,7 +160,7 @@ describe('Podman credential and mount plans', () => {
     });
   });
 
-  it('selects Claude auth variables by the provider hostname', () => {
+  it('uses the Claude API-key contract for every compatible provider', () => {
     const runtime = buildSessionRuntimePaths(config(), { larkAppId: 'cli_app', openId: 'ou_user' }, 'provider-auth');
     const plan = (baseUrl: string) => buildCredentialInjectionPlan({
       cliId: 'claude-code',
@@ -171,7 +171,7 @@ describe('Podman credential and mount plans', () => {
       model: 'claude-sonnet',
     });
 
-    expect(plan('https://api.deepseek.com/anthropic').secretEnvVar).toBe('ANTHROPIC_AUTH_TOKEN');
+    expect(plan('https://api.deepseek.com/anthropic').secretEnvVar).toBe('ANTHROPIC_API_KEY');
     expect(plan('https://api.kimi.com/coding/').secretEnvVar).toBe('ANTHROPIC_API_KEY');
     expect(plan('https://api.anthropic.com/v1').secretEnvVar).toBe('ANTHROPIC_API_KEY');
   });

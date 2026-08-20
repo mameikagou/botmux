@@ -368,8 +368,9 @@ describe('PodmanExecutionProvider', () => {
     });
   });
 
-  it('uses DeepSeek bearer auth without writing Claude API-key consent state', async () => {
+  it('uses DeepSeek API-key auth and writes Claude API-key consent state', async () => {
     const fixture = makeFixture();
+    const deepseekSecret = 'deepseek-api-secret-0123456789abcdef';
     const provider = new PodmanExecutionProvider(fixture.config, {
       commandRunner: fakeRunner([]),
       checkImage: false,
@@ -391,12 +392,17 @@ describe('PodmanExecutionProvider', () => {
       cliId: 'claude-code',
       bin: 'claude',
       args: ['--version'],
-      credentialSecret: 'deepseek-token',
+      credentialSecret: deepseekSecret,
     });
-    expect(launch.env.ANTHROPIC_AUTH_TOKEN).toBe('deepseek-token');
-    expect(launch.env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(launch.env.ANTHROPIC_API_KEY).toBe(deepseekSecret);
+    expect(launch.env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    expect(launch.args.some(arg => arg.includes('ANTHROPIC_API_KEY'))).toBe(true);
+    expect(launch.args.some(arg => arg.includes('ANTHROPIC_AUTH_TOKEN'))).toBe(false);
     const state = JSON.parse(readFileSync(join(prepared.runtime.homeRoot, '.claude.json'), 'utf8')) as Record<string, unknown>;
-    expect(state.customApiKeyResponses).toBeUndefined();
+    expect(state.customApiKeyResponses).toEqual({
+      approved: [deepseekSecret.slice(-20)],
+      rejected: [],
+    });
     expect(state.penguinModeOrgEnabled).toBeUndefined();
   });
 
