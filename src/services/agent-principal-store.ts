@@ -417,12 +417,13 @@ export class AgentPrincipalRepository {
   /** Read the explicit skill snapshot for a new topic. Existing topics retain
    * their Session copy and never call this method for ordinary messages. */
   async getPrincipalSkills(key: AgentPrincipalKey): Promise<readonly FrozenPrincipalSkillBinding[]> {
+    // These three operator-approved skills are mandatory for every principal.
+    // Seed them at the same new-instance boundary so principals created after
+    // the initial deployment also get durable DB rows before their snapshot is
+    // frozen. ON CONFLICT preserves any existing per-principal metadata.
+    await ensureDefaultPrincipalSkillRows(this.db, key);
     const rows = await readPrincipalSkillRows(this.db, key);
-    const frozen = freezePrincipalSkillRows(rows);
-    // A freshly migrated principal may not have an explicit row yet. Keep the
-    // operator-approved defaults available during rolling deployment; once an
-    // explicit list exists, it is authoritative (including an empty list).
-    return frozen.length > 0 ? frozen : discoverDefaultPrincipalSkills();
+    return freezePrincipalSkillRows(rows);
   }
 
   /** Persist the operator-approved skill leaves for one app-scoped principal. */
@@ -585,7 +586,9 @@ export class AgentPrincipalRepository {
          RETURNING lark_app_id, open_id, enabled, can_openmemory, execution_mode, created_at, updated_at`,
         [appId, openId, input.enabled ?? null, input.canOpenMemory ?? null, input.executionMode ?? null],
       );
-      return parsePrincipal(result.rows[0]!);
+      const principal = parsePrincipal(result.rows[0]!);
+      await ensureDefaultPrincipalSkillRows(this.db, input.key);
+      return principal;
     } catch (error) {
       throw toDbError(error);
     }
@@ -786,6 +789,7 @@ export class AgentPrincipalRepository {
         result.push(parsePrincipal(upserted.rows[0]!));
       }
       await client.query('COMMIT');
+      for (const row of rows) await ensureDefaultPrincipalSkillRows(this.db, row.key);
       return result;
     } catch (error) {
       await client.query('ROLLBACK').catch(() => undefined);
