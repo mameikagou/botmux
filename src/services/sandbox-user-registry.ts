@@ -898,8 +898,9 @@ export class SandboxUserRegistryRepository {
            (runtime_id, sandbox_user_id, session_id, pod_generation, harness, state, image_digest, container_name,
             workspace_path, home_path, credential_version, source_repo, source_branch, manifest)
          VALUES ($1, $2, $3, $4, $5, 'provisioning', $6, $7, $8, $9, $10, $11, $12,
-                 jsonb_build_object('schemaVersion', 2, 'runtimeId', $1, 'sessionId', $3,
-                   'sandboxUserId', $2, 'podGeneration', $4, 'harness', $5, 'imageDigest', $6))
+                 jsonb_build_object('schemaVersion', 2, 'runtimeId', $1::text, 'sessionId', $3::text,
+                   'sandboxUserId', $2::text, 'podGeneration', $4::bigint,
+                   'harness', $5::text, 'imageDigest', $6::text))
          RETURNING runtime_id, sandbox_user_id, session_id, pod_generation, harness, state, image_digest, container_name,
                    workspace_path, home_path, credential_version, source_repo, source_branch,
                    created_at, updated_at, stopped_at, failure_code`,

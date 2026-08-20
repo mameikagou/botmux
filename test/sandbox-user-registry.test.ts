@@ -69,6 +69,8 @@ describe('v4 sandbox user registry', () => {
       sandboxUserId: 'user-a', sessionId: 'session-a', podGeneration: 2,
       harness: 'claude-code', imageDigest: 'localhost/botmux:test@sha256:' + 'a'.repeat(64),
     });
+    expect(pool.lastInsertSql).toContain("'runtimeId', $1::text");
+    expect(pool.lastInsertSql).toContain("'podGeneration', $4::bigint");
     expect(runtime.podGeneration).toBe(2);
     const running = await repository.updateRuntimeState({
       runtimeId: runtime.runtimeId, state: 'running', expectedState: 'provisioning',
@@ -177,6 +179,7 @@ class ScriptedPool implements SqlPool {
 
 class RuntimePool implements SqlPool {
   private row: Record<string, unknown> | undefined;
+  lastInsertSql = '';
 
   async connect(): Promise<SqlTransaction> {
     return {
@@ -190,6 +193,7 @@ class RuntimePool implements SqlPool {
 
   async query<Row = Record<string, unknown>>(text: string, values: readonly unknown[] = []): Promise<SqlResult<Row>> {
     if (text.includes('INSERT INTO sandbox_pod_runtime_manifests')) {
+      this.lastInsertSql = text;
       const now = '2026-08-20T00:00:00.000Z';
       this.row = {
         runtime_id: values[0], sandbox_user_id: values[1], session_id: values[2], pod_generation: values[3],
