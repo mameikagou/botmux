@@ -18,6 +18,20 @@ export interface EncryptedCredential {
   readonly nonce: Buffer;
 }
 
+/**
+ * Stable identity used by the v4 user registry.  Unlike the v3 principal
+ * AAD, this identity is not an app-scoped open_id, so the same user can be
+ * bound to more than one Lark app without making a credential portable to a
+ * different harness or metadata version.
+ */
+export interface SandboxCredentialAad {
+  readonly sandboxUserId: string;
+  readonly harness: string;
+  readonly baseUrl?: string;
+  readonly model?: string;
+  readonly credentialVersion: number;
+}
+
 function fail(message: string): never {
   throw new Error(`[agent-credentials] ${message}`);
 }
@@ -72,6 +86,74 @@ function aadForPrincipal(larkAppId: string, openId: string): Buffer {
     fail('principal key is invalid for credential encryption');
   }
   return Buffer.from(`botmux-agent-credential\0${larkAppId}\0${openId}`, 'utf8');
+}
+
+function aadForSandboxUser(input: SandboxCredentialAad): Buffer {
+  if (!input || typeof input !== 'object') fail('sandbox credential AAD is invalid');
+  if (typeof input.sandboxUserId !== 'string' || !input.sandboxUserId.trim()
+    || typeof input.harness !== 'string' || !input.harness.trim()
+    || /[\u0000\r\n]/u.test(`${input.sandboxUserId}${input.harness}`)) {
+    fail('sandbox credential identity is invalid');
+  }
+  if (!Number.isSafeInteger(input.credentialVersion) || input.credentialVersion < 1) {
+    fail('sandbox credential version is invalid');
+  }
+  const baseUrl = input.baseUrl ?? '';
+  const model = input.model ?? '';
+  if (typeof baseUrl !== 'string' || typeof model !== 'string' || /[\u0000\r\n]/u.test(`${baseUrl}${model}`)) {
+    fail('sandbox credential metadata is invalid');
+  }
+  return Buffer.from(
+    `botmux-sandbox-user-credential\0${input.sandboxUserId.trim()}\0${input.harness.trim()}\0${baseUrl.trim()}\0${model.trim()}\0${input.credentialVersion}`,
+    'utf8',
+  );
+}
+
+/** Encrypt a v4 per-user/per-harness credential with metadata-bound AAD. */
+export function encryptSandboxUserCredential(
+  plaintext: string | Buffer,
+  masterKey: Buffer,
+  aad: SandboxCredentialAad,
+): EncryptedCredential {
+  const key = validateKey(masterKey);
+  const nonce = randomBytes(AGENT_CREDENTIAL_NONCE_BYTES);
+  const cipher = createCipheriv(AGENT_CREDENTIAL_ALGORITHM, key, nonce);
+  cipher.setAAD(aadForSandboxUser(aad));
+  const body = Buffer.isBuffer(plaintext) ? plaintext : Buffer.from(plaintext, 'utf8');
+  const ciphertext = Buffer.concat([cipher.update(body), cipher.final(), cipher.getAuthTag()]);
+  return { ciphertext, nonce };
+}
+
+/** Decrypt a v4 credential; any user/harness/metadata mismatch fails closed. */
+export function decryptSandboxUserCredential(
+  encrypted: EncryptedCredential,
+  masterKey: Buffer,
+  aad: SandboxCredentialAad,
+): Buffer {
+  const key = validateKey(masterKey);
+  if (!Buffer.isBuffer(encrypted.nonce) || encrypted.nonce.length !== AGENT_CREDENTIAL_NONCE_BYTES) {
+    fail('sandbox credential nonce has an invalid length');
+  }
+  if (!Buffer.isBuffer(encrypted.ciphertext) || encrypted.ciphertext.length < AGENT_CREDENTIAL_TAG_BYTES) {
+    fail('sandbox credential ciphertext is truncated');
+  }
+  const tagOffset = encrypted.ciphertext.length - AGENT_CREDENTIAL_TAG_BYTES;
+  const decipher = createDecipheriv(AGENT_CREDENTIAL_ALGORITHM, key, encrypted.nonce);
+  decipher.setAAD(aadForSandboxUser(aad));
+  decipher.setAuthTag(encrypted.ciphertext.subarray(tagOffset));
+  try {
+    return Buffer.concat([decipher.update(encrypted.ciphertext.subarray(0, tagOffset)), decipher.final()]);
+  } catch {
+    fail('sandbox credential authentication failed');
+  }
+}
+
+export function decryptSandboxUserCredentialUtf8(
+  encrypted: EncryptedCredential,
+  masterKey: Buffer,
+  aad: SandboxCredentialAad,
+): string {
+  return decryptSandboxUserCredential(encrypted, masterKey, aad).toString('utf8');
 }
 
 export function encryptCredential(

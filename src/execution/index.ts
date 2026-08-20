@@ -3,5 +3,6 @@ export * from './podman-provider.js';
 export * from '../services/agent-principal-store.js';
 export * from '../services/agent-principal-crypto.js';
 export * from '../services/agent-credential-policy.js';
+export * from '../services/sandbox-user-registry.js';
 export * from '../core/agent-principal-boundary.js';
 export * from '../services/agent-data-publish-relay.js';
