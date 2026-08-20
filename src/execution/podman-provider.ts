@@ -736,6 +736,12 @@ export class PodmanExecutionProvider {
       if (credential.providerConfig) {
         ensureProviderConfig(credential.providerConfig.path, credential.providerConfig);
       }
+      if (cliId === 'claude-code') {
+        // Claude's onboarding/trust state belongs to this disposable session
+        // home.  Seed only the flags for the mounted container cwd and merge
+        // the existing object so user/provider MCP entries survive restarts.
+        ensureClaudeState(runtime.homeRoot);
+      }
       if (memoryGate) {
         ensureMemoryMcpConfig(runtime.homeRoot, cliId, memoryGate);
       } else {
@@ -1112,6 +1118,53 @@ function ensureProviderConfig(path: string, plan: NonNullable<CredentialInjectio
     : mergeProviderJson(previous, plan);
   writeFileSync(parsed, body, { mode: 0o600 });
   chmodSync(parsed, 0o600);
+}
+
+function ensureClaudeState(sessionHome: string): void {
+  const path = join(sessionHome, '.claude.json');
+  ensureDirectory(dirname(path));
+  if (existsSync(path)) {
+    const stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink()) fail(`Claude state is not a regular file: ${path}`);
+  }
+
+  let data: Record<string, unknown> = {};
+  if (existsSync(path)) {
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        fail('Claude state must be an object');
+      }
+      data = parsed as Record<string, unknown>;
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith('[podman]')) throw error;
+      fail('Claude state is invalid');
+    }
+  }
+
+  const currentProjects = data.projects;
+  if (currentProjects !== undefined
+    && (!currentProjects || typeof currentProjects !== 'object' || Array.isArray(currentProjects))) {
+    fail('Claude state projects must be an object');
+  }
+  const projects = (currentProjects ?? {}) as Record<string, unknown>;
+  const currentProject = projects[CONTAINER_WORKDIR];
+  if (currentProject !== undefined
+    && (!currentProject || typeof currentProject !== 'object' || Array.isArray(currentProject))) {
+    fail('Claude state project entry must be an object');
+  }
+
+  data.hasCompletedOnboarding = true;
+  data.projects = {
+    ...projects,
+    [CONTAINER_WORKDIR]: {
+      ...((currentProject ?? {}) as Record<string, unknown>),
+      hasTrustDialogAccepted: true,
+      hasCompletedProjectOnboarding: true,
+    },
+  };
+  writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
+  chmodSync(path, 0o600);
 }
 
 function controlledTomlSection(header: string, removeProvider: boolean, removeMemory: boolean): boolean {

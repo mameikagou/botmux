@@ -299,6 +299,61 @@ describe('PodmanExecutionProvider', () => {
     expect(launch.args).not.toContain('/home/admin/.botmux/claude-plugin');
   });
 
+  it('seeds Claude onboarding and cwd trust while preserving existing state', async () => {
+    const fixture = makeFixture();
+    const runtime = buildSessionRuntimePaths(fixture.config, { larkAppId: 'cli_test', openId: 'ou_claude_state' }, 'claude-state');
+    const statePath = join(runtime.homeRoot, '.claude.json');
+    mkdirSync(runtime.homeRoot, { recursive: true });
+    writeFileSync(statePath, JSON.stringify({
+      hasCompletedOnboarding: false,
+      mcpServers: { existing: { type: 'http', url: 'https://existing.example/mcp' } },
+      projects: {
+        '/workspace/analyze': { custom: 'keep', hasTrustDialogAccepted: false },
+        '/workspace/other': { custom: 'other' },
+      },
+    }, null, 2));
+    const provider = new PodmanExecutionProvider(fixture.config, {
+      commandRunner: fakeRunner([]),
+      checkImage: false,
+      hostUid: 1000,
+      hostGid: 1000,
+    });
+    const prepared = await provider.prepare({
+      sessionId: 'claude-state',
+      cliId: 'claude-code',
+      principalBinding: { larkAppId: 'cli_test', openId: 'ou_claude_state' },
+      credentialBinding: {
+        kind: 'api',
+        version: 1,
+        baseUrl: 'https://api.example.com/v1',
+        model: 'claude-state-test',
+      },
+    });
+    const state = JSON.parse(readFileSync(statePath, 'utf8')) as {
+      hasCompletedOnboarding: boolean;
+      mcpServers: Record<string, unknown>;
+      projects: Record<string, Record<string, unknown>>;
+    };
+    expect(state.hasCompletedOnboarding).toBe(true);
+    expect(state.mcpServers.existing).toEqual({ type: 'http', url: 'https://existing.example/mcp' });
+    expect(state.projects['/workspace/analyze']).toMatchObject({
+      custom: 'keep',
+      hasTrustDialogAccepted: true,
+      hasCompletedProjectOnboarding: true,
+    });
+    expect(state.projects['/workspace/other']).toEqual({ custom: 'other' });
+    const launch = provider.launch(prepared, {
+      cliId: 'claude-code',
+      bin: 'claude',
+      args: ['--version'],
+      credentialSecret: 'claude-state-secret',
+    });
+    expect(launch.env.ANTHROPIC_AUTH_TOKEN).toBe('claude-state-secret');
+    expect(launch.env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(launch.args.some(arg => arg.includes('ANTHROPIC_AUTH_TOKEN'))).toBe(true);
+    expect(launch.args.some(arg => arg.includes('ANTHROPIC_API_KEY'))).toBe(false);
+  });
+
  it('stops without deleting runtime and gates destructive deletion', async () => {
    const fixture = makeFixture();
     let syncStopCalls = 0;

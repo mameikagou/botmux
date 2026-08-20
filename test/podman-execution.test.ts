@@ -151,10 +151,10 @@ describe('Podman credential and mount plans', () => {
     const mounts = buildPodmanMountPlan(config(), runtime, injection);
     expect(mounts.some(mount => mount.kind === 'codex-auth')).toBe(false);
     expect(injection.providerConfig?.path).toBe(`${runtime.homeRoot}/.agent/providers/claude.json`);
-    expect(injection.secretEnvVar).toBe('ANTHROPIC_API_KEY');
+    expect(injection.secretEnvVar).toBe('ANTHROPIC_AUTH_TOKEN');
     expect(JSON.stringify(injection)).not.toContain('sk-test');
     expect(materializeCredentialEnvironment(injection, 'sk-test')).toMatchObject({
-      ANTHROPIC_API_KEY: 'sk-test',
+      ANTHROPIC_AUTH_TOKEN: 'sk-test',
       ANTHROPIC_BASE_URL: 'https://api.example.com/v1',
       ANTHROPIC_MODEL: 'claude-sonnet',
     });

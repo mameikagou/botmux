@@ -470,7 +470,10 @@ function credentialContract(cliId: PodmanCliId): {
       };
     case 'claude-code':
       return {
-        secretEnvVar: 'ANTHROPIC_API_KEY',
+        // Claude treats ANTHROPIC_API_KEY as an interactive custom-key
+        // acknowledgement path.  The sandbox contract uses the bearer-token
+        // variable so API credentials never trigger that login prompt.
+        secretEnvVar: 'ANTHROPIC_AUTH_TOKEN',
         baseUrlEnvVar: 'ANTHROPIC_BASE_URL',
         modelEnvVar: 'ANTHROPIC_MODEL',
         configRelativePath: '.agent/providers/claude.json',
