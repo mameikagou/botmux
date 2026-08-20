@@ -166,6 +166,10 @@ describe('PodmanExecutionProvider', () => {
     expect(argv).toContain('--interactive');
     expect(argv).toContain('--tty');
     expect(argv).toContain('--userns=keep-id');
+    expect(argv).toContain('--pids-limit=512');
+    expect(argv).toContain('--memory-swap=1g');
+    expect(argv).toContain('--label=io.botmux.resource.memory-bytes=1000000000');
+    expect(argv).toContain('--label=io.botmux.resource.cpus=1');
     expect(argv).toContain('--network=pasta:--no-map-gw');
     expect(argv).not.toContain('18181');
     expect(argv).toContain('--add-host=host.containers.internal:127.0.0.1');

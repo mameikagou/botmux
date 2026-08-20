@@ -48,6 +48,13 @@ import {
   buildOwnerMemoryGatePlanFromCapability,
   type MemoryGateSessionPlan,
 } from '../services/openmemory-memory-gate.js';
+import {
+  acquirePodmanResourceLease,
+  assertPodmanRuntimeDiskHeadroom,
+  podmanMemoryBytes,
+  PODMAN_CONTAINER_PIDS_LIMIT,
+  type PodmanResourceLease,
+} from './podman-resource-admission.js';
 
 const CONTAINER_HOME = '/home/dev';
 const CONTAINER_WORKSPACE = '/workspace';
@@ -164,6 +171,8 @@ export interface ContainerLaunchSpec {
   readonly cliId: PodmanCliId;
   readonly runtime: SessionRuntimePaths;
   readonly transcriptPaths: TranscriptPathMap;
+  /** Releases the host admission slot when the child never reached Podman. */
+  readonly releaseResource: () => void;
 }
 
 export type RuntimeStatus = 'missing' | 'created' | 'running' | 'exited' | 'stopped' | 'unknown';
@@ -633,6 +642,7 @@ export class PodmanExecutionProvider {
   private readonly hostUid: number;
   private readonly hostGid: number;
   private readonly hostEnv: Readonly<Record<string, string>>;
+  private readonly resourceLeases = new Map<string, PodmanResourceLease>();
 
   constructor(config: PodmanExecutionConfig, options: PodmanExecutionProviderOptions = {}) {
     this.config = canonicalPreparedConfig(config);
@@ -738,6 +748,7 @@ export class PodmanExecutionProvider {
         await requireCommandSuccess(this.runner, 'podman', ['image', 'exists', this.config.image], { timeoutMs: PODMAN_TIMEOUT_MS });
       }
       ensureDirectory(this.config.runtimeRoot);
+      assertPodmanRuntimeDiskHeadroom(this.config.runtimeRoot);
       ensureDirectory(runtime.principalRoot);
       ensureDirectory(runtime.sessionRoot);
       ensureDirectory(runtime.workspaceRoot);
@@ -1042,12 +1053,16 @@ export class PodmanExecutionProvider {
       ...prepared.network.addHosts.map(host => `--add-host=${host}`),
       '--cap-drop=ALL',
       '--security-opt=no-new-privileges',
-      '--pids-limit=2048',
+      `--pids-limit=${String(PODMAN_CONTAINER_PIDS_LIMIT)}`,
       `--memory=${prepared.config.memory}`,
+      // Do not let a guest consume host swap on top of its hard memory cap.
+      `--memory-swap=${prepared.config.memory}`,
       `--cpus=${String(prepared.config.cpus)}`,
       '--tmpfs=/tmp:rw,nosuid,nodev',
       '--label=io.botmux.managed=true',
       `--label=io.botmux.session=${prepared.runtime.sessionHash}`,
+      `--label=io.botmux.resource.memory-bytes=${String(podmanMemoryBytes(prepared.config.memory))}`,
+      `--label=io.botmux.resource.cpus=${String(prepared.config.cpus)}`,
       `--name=${prepared.runtime.containerName}`,
       '--workdir=/workspace/analyze',
       ...prepared.mounts.map(mount => `--mount=${mountArgument(mount)}`),
@@ -1059,6 +1074,14 @@ export class PodmanExecutionProvider {
       args.push(secretKeys.has(key) ? `--env=${key}` : `--env=${key}=${value}`);
     }
     args.push(prepared.config.image, '--', ...cliArgs);
+    const resourceLease = acquirePodmanResourceLease(
+      this.config.runtimeRoot,
+      prepared.runtime.sessionHash,
+      podmanMemoryBytes(prepared.config.memory),
+      prepared.config.cpus,
+    );
+    this.resourceLeases.set(prepared.runtime.sessionRoot, resourceLease);
+    const releaseResource = (): void => this.releaseResource(prepared);
     // The secret is intentionally absent from args. Callers must use env as
     // the child environment when spawning this exact Podman argv.
     return {
@@ -1070,6 +1093,7 @@ export class PodmanExecutionProvider {
       cliId: prepared.cliId,
       runtime: prepared.runtime,
       transcriptPaths: prepared.transcriptPaths,
+      releaseResource,
     };
   }
 
@@ -1083,11 +1107,14 @@ export class PodmanExecutionProvider {
     );
     if (result.status !== 0) {
       if (/no such container|not found|does not exist/iu.test(result.stderr)) {
+        this.releaseResource(prepared);
         return { status: 'missing', containerName: prepared.runtime.containerName };
       }
       return { status: 'unknown', containerName: prepared.runtime.containerName, error: result.stderr.trim() || `exit ${String(result.status)}` };
     }
-    return parseInspectState(result.stdout.trim(), prepared.runtime.containerName);
+    const state = parseInspectState(result.stdout.trim(), prepared.runtime.containerName);
+    if (state.status === 'exited' || state.status === 'stopped') this.releaseResource(prepared);
+    return state;
   }
 
   async stop(prepared: PreparedExecution): Promise<void> {
@@ -1101,6 +1128,7 @@ export class PodmanExecutionProvider {
     if (result.status !== 0 && !/no such container|not found|does not exist/iu.test(result.stderr)) {
       fail(`could not stop ${prepared.runtime.containerName}: ${result.stderr.trim() || `exit ${String(result.status)}`}`);
     }
+    this.releaseResource(prepared);
   }
 
   /**
@@ -1119,6 +1147,7 @@ export class PodmanExecutionProvider {
     } catch {
       // Exit/crash cleanup cannot report or recover from a failed stop.
     }
+    this.releaseResource(prepared);
   }
 
   async destroyRuntime(prepared: PreparedExecution, authorization?: { readonly authorized: true }): Promise<void> {
@@ -1145,7 +1174,15 @@ export class PodmanExecutionProvider {
     if (result.status !== 0 && !/no such container|not found|does not exist/iu.test(result.stderr)) {
       fail(`could not remove ${prepared.runtime.containerName}: ${result.stderr.trim() || `exit ${String(result.status)}`}`);
     }
+    this.releaseResource(prepared);
     rmSync(sessionRoot, { recursive: true, force: true });
+  }
+
+  private releaseResource(prepared: PreparedExecution): void {
+    const lease = this.resourceLeases.get(prepared.runtime.sessionRoot);
+    if (!lease) return;
+    this.resourceLeases.delete(prepared.runtime.sessionRoot);
+    lease.release();
   }
 }
 

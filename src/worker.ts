@@ -12843,6 +12843,7 @@ async function spawnCli(
   let spawnBin = podmanExecution ? fixedPodmanCliBinary(cfg.cliId) : cliAdapter.resolvedBin;
   let spawnArgs = args;
   let spawnCwd = cfg.workingDir;
+  let releasePodmanResource: (() => void) | undefined;
 
   // Dashboard「复现命令」：在**任何** sandbox 包装（下方 macOS Seatbelt / Linux bwrap /
   // credential-only）之前，记下**基础 CLI** 的 bin/args（cliAdapter.resolvedBin +
@@ -13624,6 +13625,7 @@ async function spawnCli(
     spawnArgs = [...podmanLaunch.args];
     spawnCwd = podmanLaunch.cwd;
     spawnEnv = { ...podmanLaunch.env };
+    releasePodmanResource = podmanLaunch.releaseResource;
     // The Podman argv is already the complete transport command. Do not let
     // legacy per-bot env, launchShell, wrappers, or host sandbox wrappers
     // re-enter the process boundary.
@@ -13676,6 +13678,8 @@ async function spawnCli(
       launchShell: podmanExecution ? undefined : lastInitConfig?.launchShell,
     });
   } catch (err) {
+    releasePodmanResource?.();
+    releasePodmanResource = undefined;
     cleanupCodexAppControlBootstrap();
     throw err;
   } finally {
