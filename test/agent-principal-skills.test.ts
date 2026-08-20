@@ -24,6 +24,15 @@ function tempRoot(): string {
 }
 
 describe('principal skill policy', () => {
+  it('keeps the environment contract in the default principal snapshot', () => {
+    expect([...DEFAULT_PRINCIPAL_SKILL_NAMES]).toEqual([
+      'mainline-drift-audit',
+      'sanity',
+      'quant-ui-sync',
+      'sandbox-dev-environment',
+    ]);
+  });
+
   it('keeps the independent table migration app-scoped and read-only compatible', () => {
     expect(AGENT_PRINCIPAL_SKILLS_UP_SQL).toContain('agent_principal_skills');
     expect(AGENT_PRINCIPAL_SKILLS_UP_SQL).toContain('PRIMARY KEY (lark_app_id, open_id, skill_name)');
@@ -31,7 +40,7 @@ describe('principal skill policy', () => {
     expect(AGENT_PRINCIPAL_SKILLS_UP_SQL).toContain('skill_root LIKE \'/%\'');
   });
 
-  it('discovers only the three approved leaves, never the whole skills root', () => {
+  it('discovers only the approved leaves, never the whole skills root', () => {
     const root = tempRoot();
     for (const name of DEFAULT_PRINCIPAL_SKILL_NAMES) {
       mkdirSync(join(root, name), { recursive: true, mode: 0o700 });

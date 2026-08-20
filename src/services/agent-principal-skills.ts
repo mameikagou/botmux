@@ -16,11 +16,12 @@ import type {
 } from './agent-principal-store.js';
 import { AgentPrincipalLookupError } from './agent-principal-store.js';
 
-/** Default review skills attached to every newly created instance. */
+/** Default operator skills attached to every newly created instance. */
 export const DEFAULT_PRINCIPAL_SKILL_NAMES = [
   'mainline-drift-audit',
   'sanity',
   'quant-ui-sync',
+  'sandbox-dev-environment',
 ] as const;
 
 export type DefaultPrincipalSkillName = (typeof DEFAULT_PRINCIPAL_SKILL_NAMES)[number];
@@ -250,7 +251,7 @@ function normalizeSkillBinding(binding: FrozenPrincipalSkillBinding): FrozenPrin
 }
 
 /**
- * Resolve the three operator-approved defaults from the host without ever
+ * Resolve the operator-approved defaults from the host without ever
  * falling back to the entire ~/.codex/skills tree. Missing defaults are simply
  * omitted; a caller can surface that diagnostic and refuse a guest launch.
  */

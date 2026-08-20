@@ -417,7 +417,7 @@ export class AgentPrincipalRepository {
   /** Read the explicit skill snapshot for a new topic. Existing topics retain
    * their Session copy and never call this method for ordinary messages. */
   async getPrincipalSkills(key: AgentPrincipalKey): Promise<readonly FrozenPrincipalSkillBinding[]> {
-    // These three operator-approved skills are mandatory for every principal.
+    // These operator-approved skills are mandatory for every principal.
     // Seed them at the same new-instance boundary so principals created after
     // the initial deployment also get durable DB rows before their snapshot is
     // frozen. ON CONFLICT preserves any existing per-principal metadata.
@@ -435,7 +435,7 @@ export class AgentPrincipalRepository {
     return freezePrincipalSkillRows(persisted);
   }
 
-  /** Seed the three default skills without overwriting a custom principal list. */
+  /** Seed the default skills without overwriting a custom principal list. */
   async ensureDefaultPrincipalSkills(key: AgentPrincipalKey): Promise<void> {
     await ensureDefaultPrincipalSkillRows(this.db, key);
   }
