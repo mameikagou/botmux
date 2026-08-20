@@ -45,22 +45,41 @@ const commit = process.argv.slice(2).includes('--commit');
 const databaseUrl = process.env.BOTMUX_AGENT_DATABASE_URL;
 if (!databaseUrl?.trim()) throw new Error('BOTMUX_AGENT_DATABASE_URL is required');
 
-process.stdout.write(JSON.stringify({
-  dryRun: !commit,
-  users: [...new Set(GUESTS.map(seed => seed.sandboxUserId))],
-  identities: GUESTS.map(seed => ({ ...seed.key, sandboxUserId: seed.sandboxUserId, harness: seed.harness })),
-  sourceCredentials: GUESTS.filter(seed => seed.source).map(seed => ({
-    target: seed.key,
-    source: seed.source,
-    hasCredential: 'unknown',
-  })),
-}) + '\n');
-if (!commit) process.exit(0);
-
 const pool = createAgentPrincipalPool(databaseUrl);
 const masterKey = loadCredentialMasterKey();
 const legacy = new AgentPrincipalRepository(pool, masterKey);
 const registry = new SandboxUserRegistryRepository(pool, masterKey);
+
+if (!commit) {
+  const sourceCredentials: Array<{
+    readonly target: GuestSeed['key'];
+    readonly source: NonNullable<GuestSeed['source']>;
+    readonly hasCredential: boolean;
+    readonly fingerprint?: string;
+  }> = [];
+  try {
+    for (const seed of GUESTS) {
+      if (!seed.source) continue;
+      try {
+        const source = await legacy.readSecret(seed.source, undefined, seed.harness);
+        sourceCredentials.push({ target: seed.key, source: seed.source, hasCredential: true, fingerprint: credentialFingerprint(source.secret) });
+      } catch (error) {
+        if ((error as { code?: unknown } | undefined)?.code !== 'credential_missing') throw error;
+        sourceCredentials.push({ target: seed.key, source: seed.source, hasCredential: false });
+      }
+    }
+    process.stdout.write(JSON.stringify({
+      dryRun: true,
+      users: [...new Set(GUESTS.map(seed => seed.sandboxUserId))],
+      identities: GUESTS.map(seed => ({ ...seed.key, sandboxUserId: seed.sandboxUserId, harness: seed.harness })),
+      sourceCredentials,
+    }) + '\n');
+  } finally {
+    await pool.end?.();
+  }
+  process.exit(0);
+}
+
 try {
   await applyAgentPrincipalMigration(pool);
   await applySandboxUserRegistryMigration(pool);
