@@ -1,5 +1,6 @@
 /** Runtime bridge from a daemon session to the app-scoped principal authority. */
 import { AgentPrincipalRepository, createAgentPrincipalPool } from '../services/agent-principal-store.js';
+import type { FrozenPrincipalSkillBinding } from '../services/agent-principal-skills.js';
 import { loadCredentialMasterKey } from '../services/agent-principal-crypto.js';
 import { bindNewPodmanSession, materializeColdPodmanCredential } from './agent-principal-boundary.js';
 import type { DaemonSession } from './types.js';
@@ -151,6 +152,9 @@ export async function ensureSandboxPrincipalForFork(input: {
       ownerOpenId: openId,
     });
     ds.session.executionMode = mode.executionMode;
+    if (mode.principalSkills && mode.principalSkills.length > 0) {
+      ds.session.principalSkills = [...mode.principalSkills] as FrozenPrincipalSkillBinding[];
+    }
     if (mode.executionMode === 'native') {
       // Remove a pre-seeded Podman profile before persisting the native freeze;
       // forkWorker must not be able to recover it on a cold restart.

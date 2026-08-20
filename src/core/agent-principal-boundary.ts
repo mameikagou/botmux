@@ -66,12 +66,18 @@ export async function bindNewPodmanSession(input: {
     ownerOpenId: openId,
     adminOverride: input.adminOverride,
   });
-  input.ds.session.principalBinding = resolved.principalBinding;
+  // The repository reads principal skills in the same new-instance lookup.
+  // Keep the fallback for older repository doubles/builds, but never perform
+  // a per-message lookup once this binding has been persisted.
+  const principalBinding = resolved.principalSkills && resolved.principalSkills.length > 0
+    ? { ...resolved.principalBinding, skills: resolved.principalSkills }
+    : resolved.principalBinding;
+  input.ds.session.principalBinding = principalBinding;
   input.ds.session.credentialBinding = resolved.credentialBinding;
   input.ds.session.cliId = input.cliId as PodmanCliId;
   input.persist(input.ds.session);
   return {
-    principalBinding: resolved.principalBinding,
+    principalBinding,
     credentialBinding: resolved.credentialBinding,
     credentialSecret: resolved.credentialSecret,
   };
@@ -134,6 +140,7 @@ export async function materializeColdPodmanCredential(input: {
     // Keep the session's original owner binding. The repository already
     // checked that ownerOpenId is authorized for this cold lookup.
     ...(frozenPrincipal.ownerOpenId ? { ownerOpenId: frozenPrincipal.ownerOpenId } : {}),
+    ...(frozenPrincipal.skills ? { skills: frozenPrincipal.skills } : {}),
   };
   const refreshedCredential = resolved.credentialBinding;
   input.ds.session.principalBinding = refreshedPrincipal;

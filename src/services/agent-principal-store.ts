@@ -7,6 +7,16 @@ import {
   encryptCredential,
 } from './agent-principal-crypto.js';
 import { assertCredentialCompatible, type PodmanCliId, type PodmanCredentialKind } from '../execution/podman-execution.js';
+import {
+  AGENT_PRINCIPAL_SKILLS_UP_SQL,
+  ensureDefaultPrincipalSkillRows,
+  discoverDefaultPrincipalSkills,
+  freezePrincipalSkillRows,
+  readPrincipalSkillRows,
+  replacePrincipalSkillRows,
+  type FrozenPrincipalSkillBinding,
+  type AgentPrincipalSkillRow,
+} from './agent-principal-skills.js';
 
 export const AGENT_PRINCIPAL_MIGRATION_ID = '20260819_agent_principals_v1';
 
@@ -76,6 +86,8 @@ export interface FrozenPrincipalBinding extends AgentPrincipalKey {
   readonly credentialVersion: number;
   readonly credentialKind: PodmanCredentialKind;
   readonly ownerOpenId?: string;
+  /** Skill leaves read once at new-instance ingress and frozen with the topic. */
+  readonly skills?: readonly FrozenPrincipalSkillBinding[];
 }
 
 /** Session-persisted credential metadata. */
@@ -200,6 +212,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS agent_codex_login_tasks_live_idx
 `;
 
 export const AGENT_PRINCIPAL_DOWN_SQL = `
+DROP TABLE IF EXISTS agent_principal_skills;
 DROP TABLE IF EXISTS agent_codex_login_tasks;
 DROP TABLE IF EXISTS agent_model_credentials;
 DROP TABLE IF EXISTS agent_principals;
@@ -247,6 +260,7 @@ export async function applyAgentPrincipalMigration(db: SqlExecutor): Promise<voi
     await tx.query(AGENT_PRINCIPAL_UP_SQL);
     await tx.query(AGENT_CREDENTIAL_UP_SQL);
     await tx.query(AGENT_LOGIN_TASK_UP_SQL);
+    await tx.query(AGENT_PRINCIPAL_SKILLS_UP_SQL);
   });
 }
 
@@ -336,6 +350,35 @@ function parseLoginTask(row: Record<string, unknown>): AgentCodexLoginTaskRecord
   };
 }
 
+function decodePrincipalSkills(raw: unknown): readonly FrozenPrincipalSkillBinding[] {
+  if (raw === undefined || raw === null) return discoverDefaultPrincipalSkills();
+  let parsed: unknown = raw;
+  if (typeof raw === 'string') {
+    try { parsed = JSON.parse(raw); } catch { return []; }
+  }
+  if (!Array.isArray(parsed)) return [];
+  const rows: AgentPrincipalSkillRow[] = [];
+  for (const item of parsed) {
+    if (!item || typeof item !== 'object') continue;
+    try {
+      const row = item as Record<string, unknown>;
+      rows.push({
+        larkAppId: String(row.lark_app_id ?? ''),
+        openId: String(row.open_id ?? ''),
+        name: String(row.skill_name ?? ''),
+        rootDir: String(row.skill_root ?? ''),
+        enabled: boolValue(row.enabled, true),
+        priority: Number(row.priority ?? 100),
+        createdAt: dateValue(row.created_at),
+        updatedAt: dateValue(row.updated_at),
+      });
+    } catch {
+      // A malformed optional row must not widen the launch boundary.
+    }
+  }
+  return freezePrincipalSkillRows(rows);
+}
+
 function toDbError(error: unknown): AgentPrincipalLookupError {
   // Repository policy failures are already sanitized and meaningful to the
   // caller. Do not turn a disabled/not-found principal into a misleading
@@ -371,6 +414,31 @@ export class AgentPrincipalRepository {
     }
   }
 
+  /** Read the explicit skill snapshot for a new topic. Existing topics retain
+   * their Session copy and never call this method for ordinary messages. */
+  async getPrincipalSkills(key: AgentPrincipalKey): Promise<readonly FrozenPrincipalSkillBinding[]> {
+    const rows = await readPrincipalSkillRows(this.db, key);
+    const frozen = freezePrincipalSkillRows(rows);
+    // A freshly migrated principal may not have an explicit row yet. Keep the
+    // operator-approved defaults available during rolling deployment; once an
+    // explicit list exists, it is authoritative (including an empty list).
+    return frozen.length > 0 ? frozen : discoverDefaultPrincipalSkills();
+  }
+
+  /** Persist the operator-approved skill leaves for one app-scoped principal. */
+  async replacePrincipalSkills(
+    key: AgentPrincipalKey,
+    rows: readonly Pick<AgentPrincipalSkillRow, 'name' | 'rootDir' | 'enabled' | 'priority'>[],
+  ): Promise<readonly FrozenPrincipalSkillBinding[]> {
+    const persisted = await replacePrincipalSkillRows(this.db, key, rows);
+    return freezePrincipalSkillRows(persisted);
+  }
+
+  /** Seed the three default skills without overwriting a custom principal list. */
+  async ensureDefaultPrincipalSkills(key: AgentPrincipalKey): Promise<void> {
+    await ensureDefaultPrincipalSkillRows(this.db, key);
+  }
+
   async getCredential(key: AgentPrincipalKey): Promise<AgentCredentialRecord | undefined> {
     const [appId, openId] = keyValues(key);
     try {
@@ -393,7 +461,7 @@ export class AgentPrincipalRepository {
   async resolveExecutionModeForNewInstance(input: {
     readonly key: AgentPrincipalKey;
     readonly ownerOpenId?: string;
-  }): Promise<{ principal: AgentPrincipalRow; executionMode: AgentExecutionMode }> {
+  }): Promise<{ principal: AgentPrincipalRow; executionMode: AgentExecutionMode; principalSkills: readonly FrozenPrincipalSkillBinding[] }> {
     const key = { larkAppId: textKey(input.key.larkAppId, 'larkAppId'), openId: textKey(input.key.openId, 'openId') };
     let principal: AgentPrincipalRow | undefined;
     try {
@@ -411,7 +479,7 @@ export class AgentPrincipalRepository {
     if (input.ownerOpenId && input.ownerOpenId !== principal.openId) {
       throw new AgentPrincipalLookupError('disabled', 'session owner does not match the requesting principal');
     }
-    return { principal, executionMode: principal.executionMode };
+    return { principal, executionMode: principal.executionMode, principalSkills: await this.getPrincipalSkills(key) };
   }
 
   /** The only new-instance lookup. Callers must persist its result on Session. */
@@ -420,7 +488,7 @@ export class AgentPrincipalRepository {
     readonly cliId: string;
     readonly ownerOpenId?: string;
     readonly adminOverride?: boolean;
-  }): Promise<{ principal: AgentPrincipalRow; credential: AgentCredentialRecord; principalBinding: FrozenPrincipalBinding; credentialBinding: FrozenCredentialBinding; credentialSecret: string }> {
+  }): Promise<{ principal: AgentPrincipalRow; credential: AgentCredentialRecord; principalBinding: FrozenPrincipalBinding; credentialBinding: FrozenCredentialBinding; credentialSecret: string; principalSkills: readonly FrozenPrincipalSkillBinding[] }> {
     const key = { larkAppId: textKey(input.key.larkAppId, 'larkAppId'), openId: textKey(input.key.openId, 'openId') };
     const [appId, openId] = keyValues(key);
     let result: SqlResult<Record<string, unknown>>;
@@ -429,7 +497,20 @@ export class AgentPrincipalRepository {
         `SELECT p.lark_app_id, p.open_id, p.enabled, p.can_openmemory, p.execution_mode,
                 p.created_at, p.updated_at,
                 c.credential_kind, c.base_url, c.model, c.encrypted_secret,
-                c.secret_nonce, c.credential_version, c.updated_at AS credential_updated_at
+                c.secret_nonce, c.credential_version, c.updated_at AS credential_updated_at,
+                (SELECT jsonb_agg(jsonb_build_object(
+                    'lark_app_id', s.lark_app_id,
+                    'open_id', s.open_id,
+                    'skill_name', s.skill_name,
+                    'skill_root', s.skill_root,
+                    'enabled', s.enabled,
+                    'priority', s.priority,
+                    'created_at', s.created_at,
+                    'updated_at', s.updated_at
+                  ) ORDER BY s.priority ASC, s.skill_name ASC)
+                   FROM agent_principal_skills s
+                  WHERE s.lark_app_id = p.lark_app_id AND s.open_id = p.open_id AND s.enabled = true
+                ) AS principal_skills
            FROM agent_principals p
            LEFT JOIN agent_model_credentials c
              ON c.lark_app_id = p.lark_app_id AND c.open_id = p.open_id
@@ -449,6 +530,7 @@ export class AgentPrincipalRepository {
     if (principal.executionMode !== 'podman') {
       throw new AgentPrincipalLookupError('credential_incompatible', 'native principals do not use Podman credentials');
     }
+    const principalSkills = decodePrincipalSkills(row.principal_skills);
     if (!row.credential_kind || row.encrypted_secret === undefined || row.secret_nonce === undefined) {
       throw new AgentPrincipalLookupError('credential_missing', 'no compatible model credential is configured');
     }
@@ -473,6 +555,7 @@ export class AgentPrincipalRepository {
       credentialVersion: credential.credentialVersion,
       credentialKind: credential.credentialKind,
       ...(input.ownerOpenId ? { ownerOpenId: input.ownerOpenId } : {}),
+      ...(principalSkills.length > 0 ? { skills: principalSkills } : {}),
     };
     const credentialBinding: FrozenCredentialBinding = {
       kind: credential.credentialKind,
@@ -480,7 +563,7 @@ export class AgentPrincipalRepository {
       ...(credential.baseUrl ? { baseUrl: credential.baseUrl } : {}),
       ...(credential.model ? { model: credential.model } : {}),
     };
-    return { principal, credential, principalBinding, credentialBinding, credentialSecret };
+    return { principal, credential, principalBinding, credentialBinding, credentialSecret, principalSkills };
   }
 
   async upsertPrincipal(input: {

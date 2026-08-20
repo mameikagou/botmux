@@ -6927,6 +6927,9 @@ export function forkWorker(
     backendConfig: botCfg.riff,
     ...(podmanExecution ? { execution: podmanExecution } : {}),
     ...(ds.session.principalBinding ? { principalBinding: ds.session.principalBinding } : {}),
+    ...((ds.session.principalSkills ?? ds.session.principalBinding?.skills)
+      ? { principalSkills: [...(ds.session.principalSkills ?? ds.session.principalBinding?.skills ?? [])] }
+      : {}),
     ...(ds.session.credentialBinding ? { credentialBinding: ds.session.credentialBinding } : {}),
     ...(podmanExecution && ds.credentialSecret ? { credentialSecret: ds.credentialSecret } : {}),
     ...(podmanExecution && ds.memoryGateCapability ? { memoryGateCapability: ds.memoryGateCapability } : {}),

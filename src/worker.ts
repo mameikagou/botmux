@@ -1533,6 +1533,7 @@ function refreshCliPluginGeneration(
     workingDir: cfg.workingDir,
     prompt: cfg.prompt,
     replacesPriorGeneration: cfg.resume === true,
+    principalSkills: cfg.principalSkills,
   });
   for (const diagnostic of generation.diagnostics) log(`Plugin generation: ${diagnostic}`);
   if (generation.fatal) {
@@ -12277,10 +12278,17 @@ async function spawnCli(
   // The plugin set is stable only for the lifetime of one real CLI process.
   // A warm worker reattach keeps the existing Gateway and catalog untouched;
   // every fresh/resumed CLI spawn atomically refreshes both from current Bot config.
-  if (!willReattachPersistent && !podmanExecution) {
-    mcpRuntimeManifest = opts.pluginGenerationPrepared
-      ? readSessionMcpRuntimeManifest(cfg.sessionId, config.session.dataDir)
-      : await prepareCliPluginGenerationAndGateway(cfg, cliAdapter);
+  if (!willReattachPersistent) {
+    if (podmanExecution) {
+      // Podman has no host-side MCP gateway, but its opening prompt still
+      // needs the frozen principal skill catalog. The provider mounts the
+      // same leaves into the harness-native skills directory.
+      refreshCliPluginGeneration(cfg, cliAdapter);
+    } else {
+      mcpRuntimeManifest = opts.pluginGenerationPrepared
+        ? readSessionMcpRuntimeManifest(cfg.sessionId, config.session.dataDir)
+        : await prepareCliPluginGenerationAndGateway(cfg, cliAdapter);
+    }
   }
   if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
 

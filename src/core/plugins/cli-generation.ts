@@ -8,6 +8,8 @@ import type { SessionSkillManifest } from '../skills/types.js';
 import { refreshSessionPluginManifest, type SessionPluginManifest } from './session-manifest.js';
 import { refreshSessionMcpRuntimeManifest } from './mcp/session-runtime.js';
 import { resolvePluginSkillPackages } from './skills.js';
+import { loadSkillPackage } from '../skills/package.js';
+import type { FrozenPrincipalSkillBinding } from '../../services/agent-principal-skills.js';
 
 export interface CliPluginGenerationResult {
   pluginManifest: SessionPluginManifest;
@@ -45,6 +47,8 @@ export function prepareCliPluginGeneration(opts: {
   prompt: string;
   replacesPriorGeneration: boolean;
   now?: () => string;
+  /** Principal skills are read once at new-topic ingress and frozen on init. */
+  principalSkills?: readonly FrozenPrincipalSkillBinding[];
 }): CliPluginGenerationResult {
   const pluginManifest = refreshSessionPluginManifest({
     sessionId: opts.sessionId,
@@ -60,13 +64,17 @@ export function prepareCliPluginGeneration(opts: {
     now: opts.now,
   });
   const pluginSkills = resolvePluginSkillPackages(pluginManifest.pluginIds);
+  const principalSkills = (opts.principalSkills ?? []).map(skill => loadSkillPackage(skill.rootDir, {
+    source: { type: 'admin', root: skill.rootDir },
+    id: skill.name,
+  }));
   const preparedSkills = prepareSessionSkillPrompt({
     sessionId: opts.sessionId,
     cliId: opts.cliId,
     workingDir: opts.workingDir,
     prompt: opts.replacesPriorGeneration ? '' : opts.prompt,
     botPolicy: opts.bot.skills,
-    pluginSkills: pluginSkills.skills,
+    pluginSkills: [...principalSkills, ...pluginSkills.skills],
   });
   const delivery = prepareSkillDelivery(
     opts.adapter,

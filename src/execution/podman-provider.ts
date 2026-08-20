@@ -40,6 +40,8 @@ import {
   type PodmanMountPlan,
   type SessionRuntimePaths,
 } from './podman-execution.js';
+import { normalizePrincipalSkillBindings } from './podman-execution.js';
+import type { FrozenPrincipalSkillBinding } from '../services/agent-principal-skills.js';
 import {
   MEMORY_GATE_CAPABILITY_ENV,
   MEMORY_GATE_URL,
@@ -85,6 +87,8 @@ export interface PrincipalBinding {
   readonly credentialKind?: string;
   readonly credentialVersion?: number;
   readonly ownerOpenId?: string;
+  /** Explicit skill leaves snapshotted at new-topic ingress. */
+  readonly skills?: readonly FrozenPrincipalSkillBinding[];
 }
 
 /** Durable, non-secret credential metadata supplied by the future T6 layer. */
@@ -145,6 +149,7 @@ export interface PreparedExecution {
   readonly transcriptPaths: TranscriptPathMap;
   readonly hostUid: number;
   readonly hostGid: number;
+  readonly principalSkills: readonly FrozenPrincipalSkillBinding[];
 }
 export type PreparedPodmanExecution = PreparedExecution;
 
@@ -258,6 +263,7 @@ function validatePrincipal(binding: PrincipalBinding | undefined, cliId?: Podman
   readonly openId: string;
   readonly canOpenMemory: boolean;
   readonly ownerOpenId?: string;
+  readonly skills?: readonly FrozenPrincipalSkillBinding[];
 } {
   if (!binding || typeof binding !== 'object') fail('principal binding is required; database lookup is not allowed here');
   if (binding.enabled !== undefined && typeof binding.enabled !== 'boolean') {
@@ -276,7 +282,13 @@ function validatePrincipal(binding: PrincipalBinding | undefined, cliId?: Podman
   const ownerOpenId = binding.ownerOpenId === undefined
     ? undefined
     : nonEmpty(binding.ownerOpenId, 'principalBinding.ownerOpenId');
-  return { larkAppId, openId, canOpenMemory: normalizedMemoryCapability(binding), ...(ownerOpenId ? { ownerOpenId } : {}) };
+  return {
+    larkAppId,
+    openId,
+    canOpenMemory: normalizedMemoryCapability(binding),
+    ...(ownerOpenId ? { ownerOpenId } : {}),
+    ...(binding.skills ? { skills: binding.skills } : {}),
+  };
 }
 
 function validateCredential(binding: CredentialBinding | undefined, cliId: PodmanCliId): CredentialBinding & {
@@ -457,6 +469,17 @@ function cliHarness(cliId: PodmanCliId): string {
   return cliId === 'claude-code' ? 'claude' : cliId;
 }
 
+function skillTargetSubpath(cliId: PodmanCliId, name: string): string {
+  const root = cliId === 'codex'
+    ? '.codex/skills'
+    : cliId === 'claude-code'
+      ? '.claude/skills'
+      : cliId === 'pi'
+        ? '.pi/agent/skills'
+        : '.config/opencode/skills';
+  return join(root, name);
+}
+
 function checkCliLaunch(prepared: PreparedExecution, launch: PodmanCliLaunchSpec): string[] {
   if (launch.cliId !== prepared.cliId) fail(`cliId mismatch: bot is ${prepared.cliId}, launch is ${launch.cliId}`);
   const expected = CLI_BINARIES[prepared.cliId];
@@ -526,7 +549,7 @@ function assertPrepared(prepared: PreparedExecution, expectedConfig?: PodmanExec
     fail('prepared host working directory is not the canonical clone path');
   }
   if (prepared.containerWorkingDir !== CONTAINER_WORKDIR) fail('prepared container working directory is not fixed');
-  const expectedMounts = buildPodmanMountPlan(config, prepared.runtime, prepared.credential);
+  const expectedMounts = buildPodmanMountPlan(config, prepared.runtime, prepared.credential, prepared.principalSkills);
   if (JSON.stringify(expectedMounts) !== JSON.stringify(prepared.mounts)) fail('prepared mounts do not match the T4 allow-list');
   const expectedNetwork = buildPastaNetworkPlan(prepared.network.canOpenMemory);
   if (JSON.stringify(expectedNetwork) !== JSON.stringify(prepared.network)) fail('prepared network does not match the T4 allow-list');
@@ -674,6 +697,7 @@ export class PodmanExecutionProvider {
     const lockKey = `${this.config.runtimeRoot}/${runtime.principalHash}/${runtime.sessionHash}`;
     const previous = prepareLocks.get(lockKey) ?? Promise.resolve(undefined as unknown as PreparedExecution);
     const current = previous.then(async () => {
+      const principalSkills = normalizePrincipalSkillBindings(cliId, principal.skills);
       const credential = buildCredentialInjectionPlan({
         cliId,
         credentialKind: credentialBinding.kind,
@@ -683,7 +707,7 @@ export class PodmanExecutionProvider {
         baseUrl: credentialBinding.baseUrl,
         model: credentialBinding.model,
       });
-      const mounts = buildPodmanMountPlan(this.config, runtime, credential);
+      const mounts = buildPodmanMountPlan(this.config, runtime, credential, principalSkills);
       const network = buildPastaNetworkPlan(principal.canOpenMemory);
       const memoryGate = principal.canOpenMemory
         ? buildOwnerMemoryGatePlanFromCapability({
@@ -731,6 +755,19 @@ export class PodmanExecutionProvider {
       ensureDirectory(runtime.runtimeStateRoot);
       ensureDirectory(runtime.credentialCacheRoot);
       ensureDirectory(runtime.codexCredentialRoot);
+      for (const skill of principalSkills) {
+        // The skill leaf itself is a read-only nested mount. Creating only its
+        // parent slots keeps Podman from manufacturing a writable fallback
+        // directory when the source is missing.
+        ensureDirectory(dirname(join(runtime.homeRoot, skillTargetSubpath(cliId, skill.name))));
+      }
+      for (const skill of principalSkills) {
+        requireSourceDirectory(skill.rootDir, `principal skill ${skill.name}`);
+        const entrypoint = join(skill.rootDir, skill.entrypoint);
+        let entryStat: ReturnType<typeof lstatSync>;
+        try { entryStat = lstatSync(entrypoint); } catch { fail(`principal skill ${skill.name} entrypoint is unavailable: ${entrypoint}`); }
+        if (entryStat.isSymbolicLink() || !entryStat.isFile()) fail(`principal skill ${skill.name} entrypoint is not a regular file: ${entrypoint}`);
+      }
       if (credential.credentialKind === 'codex_chatgpt') requireValidCodexAuthFile(runtime.codexAuthPath);
       const hostWorkingDir = join(runtime.workspaceRoot, CLONE_DIRECTORY);
       await this.prepareClone(hostWorkingDir);
@@ -775,6 +812,7 @@ export class PodmanExecutionProvider {
         },
         hostUid: this.hostUid,
         hostGid: this.hostGid,
+        principalSkills,
       };
       assertPrepared(prepared, this.config);
       return prepared;

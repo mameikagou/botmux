@@ -9,12 +9,14 @@
 
 import { createHash } from 'node:crypto';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import type { FrozenPrincipalSkillBinding } from '../services/agent-principal-skills.js';
 
 export const PODMAN_EXECUTION_TYPE = 'podman' as const;
 export const PODMAN_MEMORY_GATE_HOST = '127.0.0.1' as const;
 export const PODMAN_MEMORY_GATE_PORT = 18181 as const;
 export const PODMAN_RUNTIME_PRINCIPAL_HASH_LENGTH = 24 as const;
 export const PODMAN_RUNTIME_SESSION_HASH_LENGTH = 24 as const;
+const CONTAINER_HOME = '/home/dev';
 
 const PODMAN_IMAGE_DIGEST_RE = /^[A-Za-z0-9][A-Za-z0-9./:_-]*@sha256:[0-9a-f]{64}$/u;
 const PODMAN_MEMORY_RE = /^[0-9]+(?:[kmgt]i?|[kmgt])?$/iu;
@@ -103,7 +105,7 @@ export interface PodmanMountPlan {
   readonly source: string;
   readonly target: string;
   readonly mode: PodmanMountMode;
-  readonly kind: 'workspace' | 'home' | 'outbox' | 'quant-data' | 'quant-data-staging' | 'investment-books' | 'codex-auth';
+  readonly kind: 'workspace' | 'home' | 'outbox' | 'quant-data' | 'quant-data-staging' | 'investment-books' | 'codex-auth' | 'principal-skill';
   /** True only for the Codex auth.json leaf mount. */
   readonly singleFile?: true;
 }
@@ -634,6 +636,58 @@ function validateMountSource(source: string, kind: string): void {
   }
 }
 
+const SKILL_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,127}$/u;
+
+function skillTargetRoot(cliId: PodmanCliId): string {
+  switch (cliId) {
+    case 'codex': return join(CONTAINER_HOME, '.codex', 'skills');
+    case 'claude-code': return join(CONTAINER_HOME, '.claude', 'skills');
+    case 'pi': return join(CONTAINER_HOME, '.pi', 'agent', 'skills');
+    case 'opencode': return join(CONTAINER_HOME, '.config', 'opencode', 'skills');
+  }
+}
+
+/**
+ * Validate the explicit DB-backed skill leaf list. A whole ~/.codex/skills
+ * root, a parent traversal, or a path whose leaf name differs from the
+ * declared skill is rejected before it can become a bind mount.
+ */
+export function normalizePrincipalSkillBindings(
+  cliId: PodmanCliId,
+  skills: readonly FrozenPrincipalSkillBinding[] | undefined,
+): FrozenPrincipalSkillBinding[] {
+  if (skills === undefined) return [];
+  if (!Array.isArray(skills) || skills.length > 32) fail('principalSkills', 'must contain at most 32 entries');
+  const seen = new Set<string>();
+  return skills.map((raw, index) => {
+    if (!raw || typeof raw !== 'object') fail(`principalSkills[${index}]`, 'must be an object');
+    const name = safeSkillName(raw.name, `principalSkills[${index}].name`);
+    const rootDir = requireNonEmptyString(raw.rootDir, `principalSkills[${index}].rootDir`);
+    if (!isAbsolute(rootDir) || rootDir.includes('\\') || rootDir.split('/').includes('..')) {
+      fail(`principalSkills[${index}].rootDir`, 'must be an absolute POSIX leaf without traversal');
+    }
+    const canonicalRoot = resolve(rootDir);
+    if (canonicalRoot === '/' || canonicalRoot.endsWith('/')) fail(`principalSkills[${index}].rootDir`, 'must be a skill leaf directory');
+    if (canonicalRoot.split('/').filter(Boolean).at(-1) !== name) {
+      fail(`principalSkills[${index}].rootDir`, 'leaf directory must match skill name');
+    }
+    const parent = canonicalRoot.split('/').filter(Boolean).at(-2);
+    if (parent !== 'skills' && parent !== 'store') {
+      fail(`principalSkills[${index}].rootDir`, 'must be inside an approved skills root');
+    }
+    if (seen.has(name)) fail(`principalSkills[${index}].name`, 'duplicate skill name');
+    seen.add(name);
+    const entrypoint = raw.entrypoint === undefined ? 'SKILL.md' : raw.entrypoint;
+    if (entrypoint !== 'SKILL.md') fail(`principalSkills[${index}].entrypoint`, 'must be SKILL.md');
+    return { name, rootDir: canonicalRoot, entrypoint: 'SKILL.md', ...(raw.version ? { version: raw.version } : {}), ...(raw.checksum ? { checksum: raw.checksum } : {}) };
+  });
+}
+
+function safeSkillName(raw: unknown, path: string): string {
+  if (typeof raw !== 'string' || !SKILL_NAME_RE.test(raw)) fail(path, 'contains unsafe characters');
+  return raw;
+}
+
 function assertRuntimePaths(config: PodmanExecutionConfig, runtime: SessionRuntimePaths): void {
   if (!/^[0-9a-f]{24}$/u.test(runtime.principalHash)) fail('runtime.principalHash', 'must be a 24-character lowercase hash');
   if (!/^[0-9a-f]{24}$/u.test(runtime.sessionHash)) fail('runtime.sessionHash', 'must be a 24-character lowercase hash');
@@ -664,6 +718,7 @@ export function buildPodmanMountPlan(
   runtime: SessionRuntimePaths,
   credential: Pick<CredentialInjectionPlan, 'credentialKind' | 'codexAuthPath'>
     & Partial<Pick<CredentialInjectionPlan, 'cliId'>>,
+  principalSkills?: readonly FrozenPrincipalSkillBinding[],
 ): readonly PodmanMountPlan[] {
   // Re-validate even when callers hold a TypeScript value.  T5 receives some
   // data from a database/config boundary, and a forged runtime object must not
@@ -697,6 +752,17 @@ export function buildPodmanMountPlan(
       mode: 'rw',
       kind: 'codex-auth',
       singleFile: true,
+    });
+  }
+  const cliId = credential.cliId ?? 'codex';
+  const skillBindings = normalizePrincipalSkillBindings(cliId, principalSkills);
+  const targetRoot = skillTargetRoot(cliId);
+  for (const skill of skillBindings) {
+    base.push({
+      source: skill.rootDir,
+      target: join(targetRoot, skill.name),
+      mode: 'ro',
+      kind: 'principal-skill',
     });
   }
   // The fixed targets and config layout make a custom/escaping mount
@@ -772,6 +838,7 @@ export function buildPodmanExecutionPlan(input: {
     readonly baseUrl?: string;
     readonly model?: string;
   };
+  readonly principalSkills?: readonly FrozenPrincipalSkillBinding[];
 }): PodmanExecutionPlan {
   const cliId = fixedBotCliId(input.botConfig);
   const runtime = buildSessionRuntimePaths(input.config, input.principal, input.sessionId);
@@ -784,7 +851,7 @@ export function buildPodmanExecutionPlan(input: {
     baseUrl: input.credential.baseUrl,
     model: input.credential.model,
   });
-  const mounts = buildPodmanMountPlan(input.config, runtime, injection);
+  const mounts = buildPodmanMountPlan(input.config, runtime, injection, input.principalSkills);
   return {
     cliId,
     runtime,
