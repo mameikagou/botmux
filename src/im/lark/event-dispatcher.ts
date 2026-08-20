@@ -1604,7 +1604,10 @@ export function canOperate(
 /**
  * Daemon 命令统一闸：canOperate 恒放行；此外，bot 配置的 `canTalkDaemonCommands`
  * 名单内的命令降到 canTalk 判定（oncall / allowedChatGroup / grant / p2pOpen 等
- * 对话放行腿命中即可）。名单外或未配置 → 与 canOperate 完全等价（现状不变）。
+ * 对话放行腿命中即可）。`/model-login` 固定按 canTalk 判定：它只在私聊中操作
+ * message.senderId 自己的模型配置；`/close` 也按 canTalk 判定，但 handler 会再次
+ * 校验只能关闭自己拥有的会话（管理员仍可代关）。两者都不授予其他管理权限。除此之外，
+ * 名单外或未配置 → 与 canOperate 完全等价（现状不变）。
  *
  * 只作用于 daemon.ts 两条路由的 DAEMON_COMMANDS 统一闸；在统一闸之前特判的命令
  * （/vc-auth /term）与 handler 内部自带 owner 闸的命令（/card /insight）
@@ -1640,7 +1643,7 @@ export function canRunDaemonCommand(
     return true;
   }
   const list = getBot(larkAppId).config.canTalkDaemonCommands;
-  if (!list?.includes(cmd)) return false;
+  if (cmd !== '/model-login' && cmd !== '/close' && !list?.includes(cmd)) return false;
   return botSender
     ? evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId).allowed
     : canTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType);
@@ -3104,7 +3107,10 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         return;
       }
 
-      logger.debug('Received message:', message);
+      const messageForLog = typeof message?.content === 'string' && /\/model-login(?:\s|"|$)/iu.test(message.content)
+        ? { ...message, content: '[redacted model configuration command]' }
+        : message;
+      logger.debug('Received message:', messageForLog);
 
       // Diagnostic: record the Lark quote-bubble UI quirk where root_id
       // appears without thread_id. decideRouting now treats this as

@@ -30,6 +30,11 @@ import {
   MCP_GATEWAY_SOCKET_ENV,
 } from '../../core/plugins/mcp/environment.js';
 import { DataPublishRelay, type DataPublishCapability, type ValidatedDataPublishRequest } from '../../services/agent-data-publish-relay.js';
+import {
+  ResultPublishRelay,
+  type ResultPublishCapability,
+  type ValidatedResultPublishRequest,
+} from '../../services/agent-result-publish-relay.js';
 
 /** Verify (and best-effort auto-install) bubblewrap so the user needn't
  *  pre-install. Installs via the system package manager when the daemon can
@@ -1068,6 +1073,16 @@ export function startOutboxWatcher(
       capability: () => DataPublishCapability | undefined;
       onRequest: (request: ValidatedDataPublishRequest) => Promise<void> | void;
     };
+    /** Optional host-side research-result publication relay.  It shares the
+     * session outbox with ordinary send/data-publish, but has its own strict
+     * request kind and one-turn capability. */
+    resultPublish?: {
+      sessionStagingRoot: string;
+      expectedSessionHash: string;
+      expectedOwnerOpenIdHash: string;
+      capability: () => ResultPublishCapability | undefined;
+      onRequest: (request: ValidatedResultPublishRequest) => Promise<void> | void;
+    };
     cliPath?: string;
   } = {},
 ): () => void {
@@ -1083,6 +1098,17 @@ export function startOutboxWatcher(
         expectedOwnerOpenIdHash: opts.dataPublish.expectedOwnerOpenIdHash,
         capability: opts.dataPublish.capability,
         onRequest: opts.dataPublish.onRequest,
+      })
+    : undefined;
+  const resultPublishRelay = opts.resultPublish
+    ? new ResultPublishRelay({
+        outboxRoot: outbox,
+        sessionId,
+        sessionStagingRoot: opts.resultPublish.sessionStagingRoot,
+        expectedSessionHash: opts.resultPublish.expectedSessionHash,
+        expectedOwnerOpenIdHash: opts.resultPublish.expectedOwnerOpenIdHash,
+        capability: opts.resultPublish.capability,
+        onRequest: opts.resultPublish.onRequest,
       })
     : undefined;
   // Host-private staging — a sibling of the outbox, NOT bound into the sandbox.
@@ -1217,8 +1243,10 @@ export function startOutboxWatcher(
   const timer = setInterval(tick, 200);
   timer.unref?.();
   dataPublishRelay?.start();
+  resultPublishRelay?.start();
   return () => {
     clearInterval(timer);
     dataPublishRelay?.stop();
+    resultPublishRelay?.stop();
   };
 }

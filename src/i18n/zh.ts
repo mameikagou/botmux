@@ -920,6 +920,8 @@ export const messages: Record<string, string> = {
   'daemon.foreign_bot_mention_prefix': '[来自 {botName} 的 @mention]',
   'daemon.ordinary_ingress_failed': '⚠️ 这条消息没有送达 CLI，请重发一次；若持续失败，可 /close 后重开话题。',
   'daemon.ordinary_ingress_admitted_reply_failed': '⚠️ 这条消息已接收，请勿原样重发（重发会重复执行）；失败发生在接收之后的状态回复/收尾步骤。若话题迟迟没有动静，可 /close 后重开话题再继续。',
+  'daemon.credential_missing_codex': '⚠️ 这条消息没有送达 Codex：你还没有绑定模型凭据。\n\n使用你自己的 ChatGPT/Codex 账号：请在当前 bot 私聊发送 `/model-login codex begin`，再按返回的设备码和完成命令操作。\n使用 API Key：发送 `/model-login api`，在凭据页提交 Base URL、API Key 和模型。\n\n绑定完成后，重发原消息即可启动 Codex。',
+  'daemon.credential_missing_api': '⚠️ 这条消息没有送达 CLI：你还没有配置模型 API。\n\n此 bot 不走账号登录。请在当前 bot 私聊发送 `/model-login` 查看格式，然后直接提交你自己的 Base URL 和 API Key。\n\n配置完成后，重发原消息即可启动 CLI。',
   'daemon.cmd_needs_active_cli': '{cmd} 需要活跃的 CLI 进程，当前话题无运行中的会话。',
   'daemon.cmd_activation_pending': '{cmd} 暂不能发送：上一条消息仍在提交中，请稍后重试。',
   'daemon.force_topic_ready': '💬 新话题已创建。请在话题内发送任务，也可以先用 /repo 选择项目。',

@@ -109,6 +109,35 @@ describe('canRunDaemonCommand gate', () => {
     expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_owner', undefined, '/status')).toBe(true);
   });
 
+  it('/model-login is self-service for canTalk users without granting admin commands', () => {
+    const bot = getBot('ct1');
+    bot.config.canTalkDaemonCommands = undefined;
+    bot.config.p2pOpen = true;
+
+    expect(canRunDaemonCommand(
+      'ct1', 'p2p_chat', 'ou_p2p_user', undefined, '/model-login', undefined, 'p2p', false, false,
+    )).toBe(true);
+    expect(canRunDaemonCommand(
+      'ct1', 'p2p_chat', 'ou_p2p_user', undefined, '/restart', undefined, 'p2p', false, false,
+    )).toBe(false);
+    expect(canRunDaemonCommand(
+      'ct1', 'oc_other', 'ou_stranger', undefined, '/model-login', undefined, 'group', false, false,
+    )).toBe(false);
+  });
+
+  it('/close is self-service for canTalk users without granting other management commands', () => {
+    const bot = getBot('ct1');
+    bot.config.canTalkDaemonCommands = undefined;
+    bot.config.p2pOpen = true;
+
+    expect(canRunDaemonCommand(
+      'ct1', 'p2p_chat', 'ou_p2p_user', undefined, '/close', undefined, 'p2p', false, false,
+    )).toBe(true);
+    expect(canRunDaemonCommand(
+      'ct1', 'p2p_chat', 'ou_p2p_user', undefined, '/restart', undefined, 'p2p', false, false,
+    )).toBe(false);
+  });
+
   it('p2pOpen leg works only when chatType is passed (fail-closed without)', () => {
     const bot = getBot('ct1');
     bot.config.p2pOpen = true;

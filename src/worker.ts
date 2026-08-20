@@ -363,6 +363,7 @@ import {
 import { AsyncSerialQueue } from './utils/async-serial-queue.js';
 import {
   PodmanExecutionProvider,
+  PODMAN_GUEST_HOST_LOOPBACK,
   fixedPodmanCliBinary,
   type PreparedExecution,
 } from './execution/podman-provider.js';
@@ -372,6 +373,13 @@ import {
   publishDataCapability,
 } from './services/agent-data-publish-relay.js';
 import { LakePublishHostBridge } from './services/agent-lake-publish-bridge.js';
+import {
+  createResultPublishCapability,
+  deriveResultPublishIdentityHash,
+  publishResultPublishCapability,
+  RESULT_PUBLISH_CAPABILITY_BASENAME,
+} from './services/agent-result-publish-relay.js';
+import { ResultPublishHostBridge } from './services/agent-result-publish-bridge.js';
 import {
   AgentPrincipalRepository,
   createAgentPrincipalPool,
@@ -481,9 +489,11 @@ let podmanExecutionProvider: PodmanExecutionProvider | null = null;
 let podmanPreparedExecution: PreparedExecution | null = null;
 /** Rotated at each accepted turn; only the capability file is host-readable. */
 let podmanDataPublishCapability: ReturnType<typeof createDataPublishCapability> | undefined;
+let podmanResultPublishCapability: ReturnType<typeof createResultPublishCapability> | undefined;
 let podmanAuthRefreshWatcher: CodexAuthRefreshWatcher | undefined;
 let podmanCredentialPool: ReturnType<typeof createAgentPrincipalPool> | undefined;
 let podmanLakePublishBridge: LakePublishHostBridge | undefined;
+let podmanResultPublishBridge: ResultPublishHostBridge | undefined;
 /** V4 guest manifest lease; created once per worker init, never per message. */
 let sandboxRuntimeLifecycle: SandboxRuntimeLifecycleHandle | undefined;
 
@@ -2618,10 +2628,43 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
       log(`Failed to publish data-lake capability: ${err?.message ?? err}`);
       publishError ??= err;
     }
+    try {
+      if (currentBotmuxTurnId) {
+        const now = Date.now();
+        if (!podmanResultPublishCapability
+          || podmanResultPublishCapability.turnId !== currentBotmuxTurnId
+          || podmanResultPublishCapability.dispatchAttempt !== currentBotmuxDispatchAttempt
+          || podmanResultPublishCapability.expiresAt <= now) {
+          podmanResultPublishCapability = createResultPublishCapability(
+            sessionId!,
+            currentBotmuxTurnId,
+            5 * 60_000,
+            now,
+            currentBotmuxDispatchAttempt,
+          );
+        }
+        publishResultPublishCapability(
+          podmanPreparedExecution.runtime.outboxRoot,
+          podmanResultPublishCapability,
+        );
+      } else {
+        podmanResultPublishCapability = undefined;
+        try {
+          unlinkSync(join(
+            podmanPreparedExecution.runtime.outboxRoot,
+            RESULT_PUBLISH_CAPABILITY_BASENAME,
+          ));
+        } catch { /* no turn means no result capability */ }
+      }
+    } catch (err: any) {
+      log(`Failed to publish research-result capability: ${err?.message ?? err}`);
+      publishError ??= err;
+    }
   }
 
   if (publishError) {
     podmanDataPublishCapability = undefined;
+    podmanResultPublishCapability = undefined;
     // The disk/daemon/worker views must rotate as one authority generation. If
     // the child-visible transport cannot publish the new token, revoke the old
     // generation and leave no in-memory authority for ready/send preflights to
@@ -2687,6 +2730,20 @@ function revokePodmanDataPublishCapability(
   }
 }
 
+function revokePodmanResultPublishCapability(
+  turnId?: string,
+  dispatchAttempt?: number,
+): void {
+  const current = podmanResultPublishCapability;
+  if (current && turnId !== undefined
+    && (current.turnId !== turnId || current.dispatchAttempt !== dispatchAttempt)) return;
+  podmanResultPublishCapability = undefined;
+  const outbox = podmanPreparedExecution?.runtime.outboxRoot;
+  if (outbox) {
+    try { unlinkSync(join(outbox, RESULT_PUBLISH_CAPABILITY_BASENAME)); } catch { /* absent or teardown racing */ }
+  }
+}
+
 function completeManagedTurnOriginRevocation(
   revoked: typeof sandboxRelayCapability,
   turnId: string | undefined,
@@ -2697,6 +2754,7 @@ function completeManagedTurnOriginRevocation(
   // revocation by submitting through the still-live host relay.
   sandboxRelayCapability = null;
   revokePodmanDataPublishCapability(turnId, dispatchAttempt);
+  revokePodmanResultPublishCapability(turnId, dispatchAttempt);
   currentVcMeetingImTurnOrigin = undefined;
   if (sessionId) {
     send({
@@ -11583,6 +11641,7 @@ async function spawnCli(
     // without a research DB configured; the relay itself remains fail-closed
     // until this host adapter accepts the exact request envelope.
     podmanLakePublishBridge = undefined;
+    podmanResultPublishBridge = undefined;
     if (cfg.principalBinding && cfg.credentialBinding
       && shouldStartCodexAuthRefreshWatcher({
         cliId: cfg.cliId,
@@ -11635,6 +11694,7 @@ async function spawnCli(
     podmanPreparedExecution = null;
     sandboxRuntimeLifecycle = undefined;
     podmanLakePublishBridge = undefined;
+    podmanResultPublishBridge = undefined;
   }
   // backendType trust-but-verify + HARD GATE (PTY 退役): an explicit per-bot
   // config (or BACKEND_TYPE env override) bypasses config.ts's default, so the
@@ -13454,6 +13514,23 @@ async function spawnCli(
             });
           },
         },
+        resultPublish: {
+          sessionStagingRoot: podmanPreparedExecution.runtime.stagingRoot,
+          expectedSessionHash: deriveResultPublishIdentityHash(podmanPreparedExecution.runtime.sessionHash),
+          expectedOwnerOpenIdHash: deriveResultPublishIdentityHash(podmanPreparedExecution.runtime.principalHash),
+          capability: () => podmanResultPublishCapability,
+          onRequest: async request => {
+            podmanResultPublishBridge ??= new ResultPublishHostBridge({
+              qlibRoot: join(cfg.execution!.sourceRepo, 'apps', 'quant-qlib'),
+              trustedArtifactRoot: join(cfg.execution!.dataRoot, 'research', 'runs'),
+            });
+            await podmanResultPublishBridge.submit({
+              request,
+              expectedSessionHash: deriveResultPublishIdentityHash(podmanPreparedExecution!.runtime.sessionHash),
+              expectedOwnerOpenIdHash: deriveResultPublishIdentityHash(podmanPreparedExecution!.runtime.principalHash),
+            });
+          },
+        },
       },
     );
     publishSandboxRelayCapability();
@@ -13713,8 +13790,12 @@ async function spawnCli(
           BOTMUX_SESSION_SCOPE: cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat',
           QRANT_SESSION_STAGING_ROOT: '/workspace/analyze/apps/quant-qlib/data/staging',
           QRANT_SESSION_OUTBOX_DIR: '/session/outbox',
+          // Keep the shared data-publish envelope on the historical 24-char
+          // runtime hashes.  result-publish derives its full digest-bound
+          // identity inside the guest CLI before invoking qlib.
           QRANT_SESSION_HASH: podmanPreparedExecution.runtime.sessionHash,
           QRANT_OWNER_OPEN_ID_HASH: podmanPreparedExecution.runtime.principalHash,
+          QRANT_FRONTEND_API_BASE_URL: `http://${PODMAN_GUEST_HOST_LOOPBACK}:8004`,
         },
       });
     } catch (error) {

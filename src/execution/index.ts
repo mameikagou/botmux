@@ -7,3 +7,5 @@ export * from '../services/agent-credential-policy.js';
 export * from '../services/sandbox-user-registry.js';
 export * from '../core/agent-principal-boundary.js';
 export * from '../services/agent-data-publish-relay.js';
+export * from '../services/agent-result-publish-relay.js';
+export * from '../services/agent-result-publish-bridge.js';

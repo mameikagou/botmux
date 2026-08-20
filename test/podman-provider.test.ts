@@ -247,6 +247,7 @@ describe('PodmanExecutionProvider', () => {
      runtimeEnv: {
        BOTMUX_CHAT_ID: 'oc_chat_test',
        BOTMUX_LARK_APP_ID: 'cli_test',
+       QRANT_FRONTEND_API_BASE_URL: 'http://169.254.1.1:8004',
      },
    });
     expect(() => provider.launch(prepared, { cliId: 'opencode', bin: 'opencode', args: ['--version'] }))
@@ -255,6 +256,9 @@ describe('PodmanExecutionProvider', () => {
     expect(JSON.stringify(prepared)).not.toContain('secret-do-not-log');
     expect(argv).not.toContain('secret-do-not-log');
     expect(argv).toContain('--rm');
+    expect(argv).toContain('--env=QRANT_FRONTEND_API_BASE_URL=http://169.254.1.1:8004');
+    expect(launch.env).not.toHaveProperty('QRANT_FRONTEND_API_TOKEN');
+    expect(argv).not.toContain('QRANT_FRONTEND_API_TOKEN');
     expect(argv).toContain('--interactive');
     expect(argv).toContain('--tty');
     expect(argv).toContain('--userns=keep-id');

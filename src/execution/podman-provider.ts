@@ -71,6 +71,8 @@ const CONTAINER_SESSION_HOME = '/home/dev/.agent';
 const CONTAINER_DATA_ROOT = '/shared/quant-data';
 const CONTAINER_KNOWLEDGE_ROOT = '/knowledge/investment-books';
 const CONTAINER_OUTBOX_ROOT = '/session/outbox';
+/** pasta's mapped host-loopback address reachable from a guest container. */
+export const PODMAN_GUEST_HOST_LOOPBACK = '169.254.1.1' as const;
 const DEFAULT_PATH = '/home/dev/.local/bin:/opt/agent-sandbox/bin:/usr/local/bin:/usr/bin:/bin';
 const PODMAN_TIMEOUT_MS = 30_000;
 const GIT_TIMEOUT_MS = 60_000;
@@ -665,6 +667,9 @@ const RUNTIME_ENV_KEYS = new Set([
   'QRANT_SESSION_OUTBOX_DIR',
   'QRANT_SESSION_HASH',
   'QRANT_OWNER_OPEN_ID_HASH',
+  // Read-only qrant result-query endpoint; credentials are intentionally not
+  // allow-listed here (the guest query client is tokenless in BotMux).
+  'QRANT_FRONTEND_API_BASE_URL',
 ]);
 
 /**
@@ -1069,6 +1074,7 @@ export class PodmanExecutionProvider {
       // staging root. The host relay derives the matching host path from the
       // same runtime workspace; no absolute host path crosses the boundary.
       BOTMUX_DATA_STAGING_ROOT: '/workspace/analyze/apps/quant-qlib/data/staging',
+      BOTMUX_RESULT_STAGING_ROOT: '/workspace/analyze/apps/quant-qlib/data/staging',
       BOTMUX_SEND_RELAY: CONTAINER_OUTBOX_ROOT,
       ...runtimeEnvironment,
       ...credentialEnvironment,

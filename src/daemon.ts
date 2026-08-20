@@ -16988,9 +16988,17 @@ function markIngressAdmitted(ctx: RoutingContext): void {
  */
 async function notifyOrdinaryIngressFailure(ctx: RoutingContext, err: unknown): Promise<never> {
   const replyAnchor = ctx.scope === 'thread' ? ctx.anchor : ctx.chatId;
+  const errorCode = err && typeof err === 'object'
+    ? (err as { code?: unknown }).code
+    : undefined;
+  const credentialMissing = !ctx.ingressAdmission?.admitted && errorCode === 'credential_missing';
   const noticeKey = ctx.ingressAdmission?.admitted
     ? 'daemon.ordinary_ingress_admitted_reply_failed'
-    : 'daemon.ordinary_ingress_failed';
+    : credentialMissing
+      ? getBot(ctx.larkAppId).config.cliId === 'codex'
+        ? 'daemon.credential_missing_codex'
+        : 'daemon.credential_missing_api'
+      : 'daemon.ordinary_ingress_failed';
   try {
     await sessionReply(
       replyAnchor,

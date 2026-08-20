@@ -135,6 +135,7 @@ vi.mock('../src/im/lark/identity-cache.js', async () => {
 import { mkdirSync } from 'node:fs';
 
 import { registerBot } from '../src/bot-registry.js';
+import { AgentPrincipalLookupError } from '../src/services/agent-principal-store.js';
 import { sessionKey } from '../src/core/types.js';
 import * as messageQueue from '../src/services/message-queue.js';
 import {
@@ -270,6 +271,44 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     ).rejects.toThrow('boom: new topic ingest');
 
     expect(repliedText()).toContain(expectedNotice());
+  });
+
+  it('missing Codex credentials explains both supported self-service setup paths', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    mocks.downloadResources.mockRejectedValue(
+      new AgentPrincipalLookupError('credential_missing', 'no compatible model credential is configured'),
+    );
+
+    await expect(
+      handleNewTopic(makeEventData('om_msg_codex_credential', 'start codex'), makeCtx('om_msg_codex_credential', 'om_msg_codex_credential')),
+    ).rejects.toMatchObject({ code: 'credential_missing' });
+
+    expect(repliedText()).toContain('/model-login codex begin');
+    expect(repliedText()).toContain('/model-login api');
+    expect(repliedText()).not.toContain(expectedNotice());
+  });
+
+  it('missing API credentials directs non-Codex users to direct Base URL and key setup', async () => {
+    mocks.downloadResources.mockRejectedValue(
+      new AgentPrincipalLookupError('credential_missing', 'no compatible model credential is configured'),
+    );
+
+    await expect(
+      handleNewTopic(makeEventData('om_msg_api_credential', 'start claude'), makeCtx('om_msg_api_credential', 'om_msg_api_credential')),
+    ).rejects.toMatchObject({ code: 'credential_missing' });
+
+    expect(repliedText()).toContain('/model-login');
+    expect(repliedText()).toContain('Base URL');
+    expect(repliedText()).toContain('API Key');
+    expect(repliedText()).not.toContain('/pair <');
+    expect(repliedText()).not.toContain('/model-login codex begin');
+    expect(repliedText()).not.toContain(expectedNotice());
   });
 
   it('successful delivery sends no failure notice', async () => {

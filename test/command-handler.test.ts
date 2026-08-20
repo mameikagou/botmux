@@ -481,7 +481,7 @@ vi.mock('../src/services/card-mode-store.js', () => ({
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation, parseCodexModelLoginCommand, buildAgentCredentialsPairingUrl, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession } from '../src/core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation, parseCodexModelLoginCommand, parseApiModelConfigCommand, buildAgentCredentialsPairingUrl, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession } from '../src/core/command-handler.js';
 import { setCardMode } from '../src/services/card-mode-store.js';
 import { writeRoleFile, deleteRoleFile, writeTeamRoleFile, deleteTeamRoleFile, resolveRole, resolveRoleFile } from '../src/core/role-resolver.js';
 import { setBotCapability, clearBotCapability } from '../src/services/bot-profile-store.js';
@@ -696,6 +696,21 @@ describe('direct Codex model-login parser', () => {
   it('does not accept a body-selected principal or extra command arguments', () => {
     expect(parseCodexModelLoginCommand('/model-login codex complete task-1 0 ou_other')).toBeUndefined();
     expect(parseCodexModelLoginCommand('/model-login codex status ou_other extra')).toBeUndefined();
+  });
+});
+
+describe('direct API model configuration parser', () => {
+  it('accepts Base URL and key with an optional model', () => {
+    expect(parseApiModelConfigCommand('/model-login https://api.example.com sk-test'))
+      .toEqual({ baseUrl: 'https://api.example.com', apiKey: 'sk-test' });
+    expect(parseApiModelConfigCommand('/model-login api https://api.example.com sk-test model-x'))
+      .toEqual({ baseUrl: 'https://api.example.com', apiKey: 'sk-test', model: 'model-x' });
+  });
+
+  it('rejects missing or extra fields', () => {
+    expect(parseApiModelConfigCommand('/model-login')).toBeUndefined();
+    expect(parseApiModelConfigCommand('/model-login https://api.example.com')).toBeUndefined();
+    expect(parseApiModelConfigCommand('/model-login https://api.example.com sk-test model-x extra')).toBeUndefined();
   });
 });
 
@@ -1395,6 +1410,7 @@ describe('handleCommand', () => {
     vi.mocked(forkSession).mockResolvedValue({ ok: true, childSessionId: 'child-sess-1' });
     vi.mocked(isForkCapableSession).mockReturnValue(true);
     vi.mocked(sessionStore.getSession).mockReturnValue(undefined);
+    vi.mocked(canOperate).mockReturnValue(true);
   });
 
   describe('/fork sub-topic', () => {
@@ -1814,6 +1830,24 @@ describe('handleCommand', () => {
   // ─── /close ─────────────────────────────────────────────────────────────
 
   describe('/close', () => {
+    it('does not let a non-admin close another user\'s session', async () => {
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_owner' }) });
+      const deps = makeDeps(ds);
+      vi.mocked(canOperate).mockReturnValue(false);
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close', { senderId: 'ou_other' }), deps, LARK_APP_ID);
+
+      expect(closeSession).not.toHaveBeenCalled();
+      expect(deps.activeSessions.get(sessionKey(ROOT_ID, LARK_APP_ID))).toBe(ds);
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('只能关闭你自己创建的会话'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
     it('closes through the authoritative worker-pool lifecycle and removes the session', async () => {
       const ds = makeDaemonSession();
       const deps = makeDeps(ds);

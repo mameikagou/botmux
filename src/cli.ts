@@ -271,6 +271,7 @@ import {
   type PersistentBackendType,
 } from './core/persistent-backend.js';
 import { runDataPublishCommand } from './cli/data-publish.js';
+import { runResultPublishCommand } from './cli/result-publish.js';
 
 // Resolve the CLI's UI locale once from the global config file, so subsequent
 // CLI output (and any t() callers that don't pass an explicit locale) honour
@@ -13229,6 +13230,10 @@ switch (command) {
   case 'data-publish':
     try { runDataPublishCommand(process.argv.slice(3)); }
     catch (error) { console.error(`data-publish failed: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 2; }
+    break;
+  case 'result-publish':
+    try { runResultPublishCommand(process.argv.slice(3)); }
+    catch (error) { console.error(`result-publish failed: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 2; }
     break;
   case 'agent-principals':
   case 'principal': {

@@ -919,6 +919,8 @@ export const messages: Record<string, string> = {
   'daemon.foreign_bot_mention_prefix': '[@mention from {botName}]',
   'daemon.ordinary_ingress_failed': '⚠️ This message did not reach the CLI. Please resend; if it keeps failing, `/close` and reopen the topic.',
   'daemon.ordinary_ingress_admitted_reply_failed': '⚠️ This message was received — do not resend it as-is (a resend would run it twice); the failure happened in a follow-up status reply or post-accept step. If nothing happens in this topic, `/close` and reopen the topic to continue.',
+  'daemon.credential_missing_codex': '⚠️ This message did not reach Codex because you have not connected model credentials yet.\n\nTo use your own ChatGPT/Codex account, send `/model-login codex begin` in a private chat with this bot, then follow the returned device-code and completion commands.\nTo use an API key, send `/model-login api` and submit the Base URL, API key, and model on the credentials page.\n\nAfter setup completes, resend the original message to start Codex.',
+  'daemon.credential_missing_api': '⚠️ This message did not reach the CLI because its model API is not configured yet.\n\nThis bot does not use account login. Send `/model-login` in a private chat to see the format, then submit your own Base URL and API key directly.\n\nAfter setup completes, resend the original message to start the CLI.',
   'daemon.cmd_needs_active_cli': '{cmd} needs an active CLI process; no running session in this topic.',
   'daemon.cmd_activation_pending': '{cmd} cannot be sent yet because the previous turn is still being submitted. Retry shortly.',
   'daemon.force_topic_ready': '💬 New topic created. Send a task in this topic, or use /repo first to choose a project.',

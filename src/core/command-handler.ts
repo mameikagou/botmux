@@ -23,7 +23,7 @@ import type { CliId, ResumableSession } from '../adapters/cli/types.js';
 import { resolveCliRuntime, runtimeInstallationKey } from '../adapters/cli/runtime.js';
 import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, getMessageThreadId, uploadFile, UserTokenMissingError } from '../im/lark/client.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
-import { claimPairing, createPairing, type StartedPairing } from '../services/pairing-store.js';
+import { claimPairing, createPairing, type PairingClaimer, type StartedPairing } from '../services/pairing-store.js';
 import { buildDashboardUrl } from './dashboard-url.js';
 import { logger } from '../utils/logger.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
@@ -102,12 +102,13 @@ import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { ensureSandboxPrincipalForFork } from './agent-principal-runtime.js';
 import { AgentPrincipalRepository, applyAgentPrincipalMigration, createAgentPrincipalPool, type AgentPrincipalKey } from '../services/agent-principal-store.js';
 import { loadCredentialMasterKey } from '../services/agent-principal-crypto.js';
-import { applySandboxUserRegistryMigration, SandboxUserRegistryRepository } from '../services/sandbox-user-registry.js';
+import { applySandboxUserRegistryMigration, SandboxUserRegistryRepository, type SandboxUserHarness } from '../services/sandbox-user-registry.js';
 import {
   CodexDeviceLoginService,
   PodmanCodexDeviceAuthRunner,
 } from '../services/codex-device-login.js';
 import { parsePodmanExecutionConfig, principalHash } from '../execution/podman-execution.js';
+import { probePodmanApiCredential } from '../services/agent-credential-probe.js';
 import {
   configuredRuntimeDisplayName,
   sessionConfiguredRuntimeDisplayName,
@@ -141,8 +142,15 @@ export function buildAgentCredentialsPairingUrl(
   return `${origin.replace(/\/$/u, '')}/agent/credentials#pairingId=${encodeURIComponent(pairing.pairingId)}&browserToken=${encodeURIComponent(pairing.browserToken)}`;
 }
 
-export function createAgentCredentialsPairingLink(dataDir = config.session.dataDir): StartedPairing & { readonly url: string } {
+export function createAgentCredentialsPairingLink(
+  dataDir = config.session.dataDir,
+  principal?: PairingClaimer,
+): StartedPairing & { readonly url: string } {
   const pairing = createPairing(dataDir);
+  if (principal) {
+    const claimed = claimPairing(dataDir, pairing.code, principal);
+    if (!claimed.ok) throw new Error('could not bind model configuration link');
+  }
   let port = config.dashboard.port;
   try {
     const parsed = Number.parseInt(readFileSync(join(homedir(), '.botmux', '.dashboard-port'), 'utf8').trim(), 10);
@@ -189,6 +197,22 @@ let commandCodexRepository: AgentPrincipalRepository | undefined;
 let commandCodexRepositoryReady: Promise<void> | undefined;
 const commandCodexLoginServices = new Map<string, CodexDeviceLoginService>();
 
+function getCommandAgentPrincipalRepository(): AgentPrincipalRepository {
+  if (commandCodexRepository) return commandCodexRepository;
+  const pool = createAgentPrincipalPool();
+  const masterKey = loadCredentialMasterKey();
+  commandCodexRepository = new AgentPrincipalRepository(
+    pool,
+    masterKey,
+    new SandboxUserRegistryRepository(pool, masterKey),
+  );
+  commandCodexRepositoryReady = (async () => {
+    await applyAgentPrincipalMigration(pool);
+    await applySandboxUserRegistryMigration(pool);
+  })();
+  return commandCodexRepository;
+}
+
 function getCommandCodexLoginService(larkAppId: string, deps: CommandHandlerDeps): CodexDeviceLoginService {
   const existing = commandCodexLoginServices.get(larkAppId);
   if (existing) return existing;
@@ -196,22 +220,10 @@ function getCommandCodexLoginService(larkAppId: string, deps: CommandHandlerDeps
   if (bot.cliId !== 'codex') throw new Error('Codex 登录仅支持 Codex bot');
   if (!bot.execution || bot.execution.type !== 'podman') throw new Error('Codex 登录需要 Podman bot');
   const execution = parsePodmanExecutionConfig(bot.execution);
-  if (!commandCodexRepository) {
-    const pool = createAgentPrincipalPool();
-    const masterKey = loadCredentialMasterKey();
-    commandCodexRepository = new AgentPrincipalRepository(
-      pool,
-      masterKey,
-      new SandboxUserRegistryRepository(pool, masterKey),
-    );
-    commandCodexRepositoryReady = (async () => {
-      await applyAgentPrincipalMigration(pool);
-      await applySandboxUserRegistryMigration(pool);
-    })();
-  }
+  const repository = getCommandAgentPrincipalRepository();
   const authRoot = execution.credentialCacheRoot;
   const service = new CodexDeviceLoginService({
-    repository: commandCodexRepository,
+    repository,
     runner: new PodmanCodexDeviceAuthRunner({ image: execution.image, authRoot }),
     authPathFor: (principal, taskId) => join(
       authRoot,
@@ -256,6 +268,21 @@ export function parseCodexModelLoginCommand(content: string):
   return undefined;
 }
 
+export function parseApiModelConfigCommand(content: string):
+  | { readonly baseUrl: string; readonly apiKey: string; readonly model?: string }
+  | undefined {
+  const args = content.replace(/^\/model-login\s*/iu, '').trim().split(/\s+/u).filter(Boolean);
+  if (args[0]?.toLowerCase() === 'api' || args[0]?.toLowerCase() === 'set') args.shift();
+  if (args.length < 2 || args.length > 3) return undefined;
+  return { baseUrl: args[0]!, apiKey: args[1]!, ...(args[2] ? { model: args[2] } : {}) };
+}
+
+function apiHarness(cliId: string): SandboxUserHarness | undefined {
+  return cliId === 'codex' || cliId === 'claude-code' || cliId === 'pi' || cliId === 'opencode'
+    ? cliId
+    : undefined;
+}
+
 async function handleCodexModelLoginCommand(
   rootId: string,
   message: LarkMessage,
@@ -272,17 +299,52 @@ async function handleCodexModelLoginCommand(
   try { bot = getBot(larkAppId).config; } catch { await reply('当前 bot 不可用。'); return; }
   const requested = message.content.replace(/^\/model-login\s*/iu, '').trim().split(/\s+/u).filter(Boolean);
   const requestedMode = requested[0]?.toLowerCase();
-  if (bot.cliId !== 'codex' && (!requestedMode || requestedMode === 'api')) {
-    const pairing = createAgentCredentialsPairingLink();
-    await reply(`当前 bot 固定 harness：${bot.cliId}。请打开凭据页：${pairing.url}\n然后在本私聊发送 /pair ${pairing.code} 完成一次性配对。`);
+  const directApiMode = bot.cliId !== 'codex' || requestedMode === 'api' || requestedMode === 'set'
+    || /^https?:\/\//iu.test(requested[0] ?? '');
+  if (directApiMode) {
+    const parsed = parseApiModelConfigCommand(message.content);
+    const harness = apiHarness(bot.cliId);
+    const defaultModel = bot.model?.trim();
+    if (!harness || !bot.execution || bot.execution.type !== 'podman') {
+      await reply('当前 bot 不支持用户 API 配置。');
+      return;
+    }
+    if (!parsed || (!parsed.model && !defaultModel)) {
+      await reply(`此 bot 使用 ${bot.cliId}，不需要登录。请直接发送：\n/model-login <BaseURL> <API_KEY>${defaultModel ? '' : ' <模型>'}\n配置成功后这条含 Key 的消息会尝试立即撤回。`);
+      return;
+    }
+    const model = parsed.model ?? defaultModel!;
+    const key: AgentPrincipalKey = { larkAppId, openId: message.senderId };
+    // The direct setup command contains the user's API key. Remove the visible
+    // Lark message as early as the platform allows; logs above already redact it.
+    await deleteMessage(larkAppId, message.messageId).catch(() => undefined);
+    try {
+      const repository = getCommandAgentPrincipalRepository();
+      await commandCodexRepositoryReady;
+      await probePodmanApiCredential({
+        execution: parsePodmanExecutionConfig(bot.execution),
+        cliId: bot.cliId,
+        apiKey: parsed.apiKey,
+        baseUrl: parsed.baseUrl,
+        model,
+      });
+      const current = await repository.getCredential(key, harness);
+      const saved = await repository.putCredential({
+        key,
+        harness,
+        credentialKind: 'api',
+        secret: parsed.apiKey,
+        baseUrl: parsed.baseUrl,
+        model,
+        expectedVersion: current?.credentialVersion ?? 0,
+      });
+      await reply(`模型 API 已配置并验证通过（${bot.cliId}，版本 ${saved.credentialVersion}）。现在直接发普通消息即可。`);
+    } catch {
+      await reply('模型 API 配置失败：请检查 Base URL、API Key 和模型是否匹配。Key 未保存。');
+    }
     return;
   }
-  if (bot.cliId !== 'codex') { await reply('此命令仅适用于 Codex bot。'); return; }
-  if (requestedMode === 'api') {
-    const pairing = createAgentCredentialsPairingLink();
-    await reply(`当前 bot 固定 harness：codex（API 凭据）。请打开凭据页：${pairing.url}\n然后在本私聊发送 /pair ${pairing.code} 完成一次性配对。`);
-    return;
-  }
+  if (bot.cliId !== 'codex') { await reply('当前 bot 只使用 Base URL 和 API Key，不走账号登录。'); return; }
   const parsed = parseCodexModelLoginCommand(message.content);
   if (!parsed) { await reply('用法：/model-login codex [begin|status|complete TASK_ID EXPECTED_VERSION|logout]'); return; }
   const key: AgentPrincipalKey = { larkAppId, openId: message.senderId };
@@ -1483,12 +1545,24 @@ export async function handleCommand(
   const loc: Locale = localeForBot(ds?.larkAppId ?? larkAppId);
 
   logger.info(`[${logTag}] Command: ${cmd}`);
-  logger.debug(`repo command`, message);
+  logger.debug('command payload', cmd === '/model-login'
+    ? { ...message, content: '[redacted model configuration command]' }
+    : message);
 
   try {
     switch (cmd) {
       case '/close': {
         if (ds) {
+          const senderCanAdminister = canOperate(
+            ds.larkAppId,
+            ds.chatId,
+            message.senderId,
+            message.senderUnionId,
+          );
+          if (ds.session.ownerOpenId && ds.session.ownerOpenId !== message.senderId && !senderCanAdminister) {
+            await sessionReply(rootId, '⚠️ 只能关闭你自己创建的会话。');
+            break;
+          }
           const targetSessionId = ds.session.sessionId;
           const closed = await withBotTurnMutation(ds.larkAppId, async () => {
             // Re-resolve the exact session after all peer admissions drain. A
