@@ -371,6 +371,10 @@ import {
   createAgentPrincipalPool,
 } from './services/agent-principal-store.js';
 import { SandboxUserRegistryRepository } from './services/sandbox-user-registry.js';
+import {
+  beginSandboxRuntimeLifecycle,
+  type SandboxRuntimeLifecycleHandle,
+} from './services/sandbox-runtime-lifecycle.js';
 import { loadCredentialMasterKey } from './services/agent-principal-crypto.js';
 import {
   CodexAuthRefreshWatcher,
@@ -474,6 +478,8 @@ let podmanDataPublishCapability: ReturnType<typeof createDataPublishCapability> 
 let podmanAuthRefreshWatcher: CodexAuthRefreshWatcher | undefined;
 let podmanCredentialPool: ReturnType<typeof createAgentPrincipalPool> | undefined;
 let podmanLakePublishBridge: LakePublishHostBridge | undefined;
+/** V4 guest manifest lease; created once per worker init, never per message. */
+let sandboxRuntimeLifecycle: SandboxRuntimeLifecycleHandle | undefined;
 
 function stopPodmanAuthRefreshWatcher(): void {
   podmanAuthRefreshWatcher?.stop();
@@ -485,13 +491,34 @@ let workerExitPromise: Promise<void> | null = null;
 function stopPreparedPodmanExecution(): void {
   revokePodmanDataPublishCapability();
   stopPodmanAuthRefreshWatcher();
-  if (!podmanExecutionProvider || !podmanPreparedExecution || podmanStopPromise) return;
+  if ((!podmanExecutionProvider || !podmanPreparedExecution) && !sandboxRuntimeLifecycle) return;
+  if (podmanStopPromise) return;
   const provider = podmanExecutionProvider;
   const prepared = podmanPreparedExecution;
   // Defer the synchronous default runner by one microtask so killCli() keeps
   // its existing non-blocking teardown contract; restart/close paths await the
   // recorded promise before launching or exiting.
-  const task = Promise.resolve().then(() => provider.stop(prepared)).catch(err => {
+  const runtime = sandboxRuntimeLifecycle;
+  const task = Promise.resolve().then(async () => {
+    // Persist the intent before stopping, but never strand the actual Podman
+    // container when the DB is unavailable during teardown.
+    try { await runtime?.markStopping(); } catch (error) {
+      log(`Sandbox runtime stopping state unavailable: ${(error as Error).message}`);
+    }
+    let stopError: unknown;
+    if (provider && prepared) {
+      try { await provider.stop(prepared); } catch (error) { stopError = error; }
+    }
+    if (!stopError) {
+      try { await runtime?.markStopped(); } catch (error) {
+        log(`Sandbox runtime stopped state unavailable: ${(error as Error).message}`);
+        stopError = error;
+      }
+    } else {
+      try { await runtime?.markFailed('podman_stop_failed'); } catch { /* preserve stop error */ }
+    }
+    if (stopError) throw stopError;
+  }).catch(err => {
     log(`Podman stop failed: ${(err as Error).message}`);
   });
   const settled = task.finally(() => {
@@ -11500,17 +11527,52 @@ async function spawnCli(
       throw new Error('Podman execution does not accept wrapperCli; the image entrypoint owns the fixed harness');
     }
     podmanExecutionProvider = new PodmanExecutionProvider(cfg.execution!);
-    podmanPreparedExecution = await podmanExecutionProvider.prepare({
-      sessionId: cfg.sessionId,
-      cliId: cfg.cliId,
-      expectedLarkAppId: cfg.larkAppId,
-      expectedOwnerOpenId: cfg.ownerOpenId,
-      principalBinding: cfg.principalBinding,
-      credentialBinding: cfg.credentialBinding,
-      sandboxUserId: cfg.sandboxUserId,
-      podGeneration: cfg.podGeneration,
-      memoryGateCapability: cfg.memoryGateCapability,
-    });
+    sandboxRuntimeLifecycle = undefined;
+    let runtimeLifecycle: SandboxRuntimeLifecycleHandle | undefined;
+    if (cfg.sandboxUserId !== undefined && cfg.podGeneration !== undefined) {
+      // The manifest is the first side effect of guest provisioning. Reuse the
+      // same pool/key as the credential authority and fail closed when the DB
+      // cannot record a new runtime. This runs once at worker init, never for
+      // ordinary topic messages handled by this worker.
+      try {
+        podmanCredentialPool ??= createAgentPrincipalPool();
+        const workerMasterKey = loadCredentialMasterKey();
+        runtimeLifecycle = await beginSandboxRuntimeLifecycle(
+          new SandboxUserRegistryRepository(podmanCredentialPool, workerMasterKey),
+          {
+            sessionId: cfg.sessionId,
+            sandboxUserId: cfg.sandboxUserId,
+            podGeneration: cfg.podGeneration,
+            execution: cfg.execution,
+            larkAppId: cfg.larkAppId,
+            openId: cfg.principalBinding?.openId ?? cfg.principalBinding?.open_id ?? cfg.ownerOpenId,
+            harness: cfg.cliId,
+            credentialVersion: cfg.credentialBinding?.version ?? cfg.credentialBinding?.credentialVersion,
+          },
+        );
+        sandboxRuntimeLifecycle = runtimeLifecycle;
+      } catch (error) {
+        throw new Error(`guest runtime manifest unavailable: ${(error as Error).message}`);
+      }
+    }
+    try {
+      podmanPreparedExecution = await podmanExecutionProvider.prepare({
+        sessionId: cfg.sessionId,
+        cliId: cfg.cliId,
+        expectedLarkAppId: cfg.larkAppId,
+        expectedOwnerOpenId: cfg.ownerOpenId,
+        principalBinding: cfg.principalBinding,
+        credentialBinding: cfg.credentialBinding,
+        sandboxUserId: cfg.sandboxUserId,
+        podGeneration: cfg.podGeneration,
+        memoryGateCapability: cfg.memoryGateCapability,
+      });
+    } catch (error) {
+      try { await runtimeLifecycle?.markFailed('podman_prepare_failed'); } catch (stateError) {
+        log(`Sandbox runtime failure state unavailable: ${(stateError as Error).message}`);
+      }
+      throw error;
+    }
     // Construct lazily on the first T3 request so a worker can still boot
     // without a research DB configured; the relay itself remains fail-closed
     // until this host adapter accepts the exact request envelope.
@@ -11565,6 +11627,7 @@ async function spawnCli(
   } else {
     podmanExecutionProvider = null;
     podmanPreparedExecution = null;
+    sandboxRuntimeLifecycle = undefined;
     podmanLakePublishBridge = undefined;
   }
   // backendType trust-but-verify + HARD GATE (PTY 退役): an explicit per-bot
@@ -13606,29 +13669,37 @@ async function spawnCli(
   }
 
   if (podmanPreparedExecution && podmanExecutionProvider) {
-    const podmanLaunch = podmanExecutionProvider.launch(podmanPreparedExecution, {
-      cliId: cfg.cliId,
-      bin: spawnBin,
-      args: spawnArgs,
-      credentialSecret: cfg.credentialSecret,
-      runtimeEnv: {
-        BOTMUX_CHAT_ID: cfg.chatId,
-        BOTMUX_CHAT_TYPE: cfg.chatType,
-        BOTMUX_LARK_APP_ID: cfg.larkAppId,
-        BOTMUX_ROOT_MESSAGE_ID: cfg.rootMessageId?.startsWith('om_') ? cfg.rootMessageId : undefined,
-        BOTMUX_TURN_ID: cfg.turnId,
-        BOTMUX_DISPATCH_ATTEMPT: cfg.dispatchAttempt === undefined ? undefined : String(cfg.dispatchAttempt),
-        BOTMUX_API_ONLY: cfg.apiOnly ? '1' : undefined,
-        BOTMUX_BRAND: cfg.brand,
-        BOTMUX_USAGE_DISPLAY: resolveUsageDisplay(cfg.larkAppId),
-        BOTMUX_DAEMON_IPC_PORT: process.env.BOTMUX_DAEMON_IPC_PORT,
-        BOTMUX_SESSION_SCOPE: cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat',
-        QRANT_SESSION_STAGING_ROOT: '/workspace/analyze/apps/quant-qlib/data/staging',
-        QRANT_SESSION_OUTBOX_DIR: '/session/outbox',
-        QRANT_SESSION_HASH: podmanPreparedExecution.runtime.sessionHash,
-        QRANT_OWNER_OPEN_ID_HASH: podmanPreparedExecution.runtime.principalHash,
-      },
-    });
+    let podmanLaunch: ReturnType<PodmanExecutionProvider['launch']>;
+    try {
+      podmanLaunch = podmanExecutionProvider.launch(podmanPreparedExecution, {
+        cliId: cfg.cliId,
+        bin: spawnBin,
+        args: spawnArgs,
+        credentialSecret: cfg.credentialSecret,
+        runtimeEnv: {
+          BOTMUX_CHAT_ID: cfg.chatId,
+          BOTMUX_CHAT_TYPE: cfg.chatType,
+          BOTMUX_LARK_APP_ID: cfg.larkAppId,
+          BOTMUX_ROOT_MESSAGE_ID: cfg.rootMessageId?.startsWith('om_') ? cfg.rootMessageId : undefined,
+          BOTMUX_TURN_ID: cfg.turnId,
+          BOTMUX_DISPATCH_ATTEMPT: cfg.dispatchAttempt === undefined ? undefined : String(cfg.dispatchAttempt),
+          BOTMUX_API_ONLY: cfg.apiOnly ? '1' : undefined,
+          BOTMUX_BRAND: cfg.brand,
+          BOTMUX_USAGE_DISPLAY: resolveUsageDisplay(cfg.larkAppId),
+          BOTMUX_DAEMON_IPC_PORT: process.env.BOTMUX_DAEMON_IPC_PORT,
+          BOTMUX_SESSION_SCOPE: cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat',
+          QRANT_SESSION_STAGING_ROOT: '/workspace/analyze/apps/quant-qlib/data/staging',
+          QRANT_SESSION_OUTBOX_DIR: '/session/outbox',
+          QRANT_SESSION_HASH: podmanPreparedExecution.runtime.sessionHash,
+          QRANT_OWNER_OPEN_ID_HASH: podmanPreparedExecution.runtime.principalHash,
+        },
+      });
+    } catch (error) {
+      try { await sandboxRuntimeLifecycle?.markFailed('podman_launch_failed'); } catch (stateError) {
+        log(`Sandbox runtime failure state unavailable: ${(stateError as Error).message}`);
+      }
+      throw error;
+    }
     spawnBin = podmanLaunch.bin;
     spawnArgs = [...podmanLaunch.args];
     spawnCwd = podmanLaunch.cwd;
@@ -13689,9 +13760,27 @@ async function spawnCli(
     releasePodmanResource?.();
     releasePodmanResource = undefined;
     cleanupCodexAppControlBootstrap();
+    try { await sandboxRuntimeLifecycle?.markFailed('podman_spawn_failed'); } catch (stateError) {
+      log(`Sandbox runtime failure state unavailable: ${(stateError as Error).message}`);
+    }
     throw err;
   } finally {
     delete childEnv[CODEX_APP_CONTROL_BOOTSTRAP_ENV];
+  }
+  if (podmanExecution && sandboxRuntimeLifecycle) {
+    try {
+      await sandboxRuntimeLifecycle.markRunning();
+    } catch (error) {
+      // A container without a durable running record is not allowed to remain
+      // alive. Stop it before propagating the init failure to the daemon.
+      try { await podmanExecutionProvider?.stop(podmanPreparedExecution!); } catch (stopError) {
+        log(`Podman stop after runtime-state failure failed: ${(stopError as Error).message}`);
+      }
+      try { await sandboxRuntimeLifecycle.markFailed('runtime_running_state_failed'); } catch (stateError) {
+        log(`Sandbox runtime failure state unavailable: ${(stateError as Error).message}`);
+      }
+      throw error;
+    }
   }
   const actuallyReattachedPersistent = 'isReattach' in backend
     && backend.isReattach === true;

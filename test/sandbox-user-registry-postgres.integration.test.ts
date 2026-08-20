@@ -59,6 +59,7 @@ describe.skipIf(!enabled)('v4 sandbox user registry PostgreSQL integration', () 
     const runtime = await registry.createRuntime({
       sandboxUserId: userId,
       sessionId: `v4_session_${process.pid}`,
+      podGeneration: 1,
       harness: 'claude-code',
       imageDigest: 'localhost/botmux:test@sha256:' + 'a'.repeat(64),
       credentialVersion: 1,

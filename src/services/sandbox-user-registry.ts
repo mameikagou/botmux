@@ -82,6 +82,8 @@ export interface SandboxPodRuntimeManifest {
   readonly runtimeId: string;
   readonly sandboxUserId: string;
   readonly sessionId: string;
+  /** Frozen pod generation; a replacement pod can never reuse an old runtime. */
+  readonly podGeneration: number;
   readonly harness: SandboxUserHarness;
   readonly state: SandboxRuntimeState;
   readonly imageDigest: string;
@@ -218,6 +220,7 @@ CREATE TABLE IF NOT EXISTS sandbox_pod_runtime_manifests (
   sandbox_user_id text NOT NULL REFERENCES sandbox_users (sandbox_user_id)
     ON UPDATE CASCADE ON DELETE CASCADE,
   session_id text NOT NULL,
+  pod_generation bigint NOT NULL DEFAULT 1 CHECK (pod_generation > 0),
   harness text NOT NULL CHECK (harness IN ('codex', 'claude-code', 'pi', 'opencode')),
   state text NOT NULL CHECK (state IN ('provisioning', 'running', 'stopping', 'stopped', 'failed')),
   image_digest text NOT NULL,
@@ -232,13 +235,31 @@ CREATE TABLE IF NOT EXISTS sandbox_pod_runtime_manifests (
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   stopped_at timestamptz,
-  UNIQUE (session_id),
+  CONSTRAINT sandbox_pod_runtime_manifests_session_generation_key UNIQUE (session_id, pod_generation),
   CHECK (length(trim(runtime_id)) > 0),
   CHECK (length(trim(session_id)) > 0),
   CHECK (length(trim(image_digest)) > 0)
 );
 CREATE INDEX IF NOT EXISTS sandbox_pod_runtime_user_state_idx
   ON sandbox_pod_runtime_manifests (sandbox_user_id, state, updated_at DESC);
+ALTER TABLE sandbox_pod_runtime_manifests
+  ADD COLUMN IF NOT EXISTS pod_generation bigint NOT NULL DEFAULT 1;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'sandbox_pod_runtime_manifests'::regclass
+      AND conname = 'sandbox_pod_runtime_manifests_pod_generation_check'
+  ) THEN
+    ALTER TABLE sandbox_pod_runtime_manifests
+      ADD CONSTRAINT sandbox_pod_runtime_manifests_pod_generation_check
+      CHECK (pod_generation > 0);
+  END IF;
+END $$;
+ALTER TABLE sandbox_pod_runtime_manifests
+  DROP CONSTRAINT IF EXISTS sandbox_pod_runtime_manifests_session_id_key;
+CREATE UNIQUE INDEX IF NOT EXISTS sandbox_pod_runtime_manifests_session_generation_key
+  ON sandbox_pod_runtime_manifests (session_id, pod_generation);
 `;
 
 export const SANDBOX_USER_REGISTRY_DOWN_SQL = `
@@ -337,6 +358,8 @@ function parseRuntime(row: Record<string, unknown>): SandboxPodRuntimeManifest {
     runtimeId: String(row.runtime_id),
     sandboxUserId: String(row.sandbox_user_id),
     sessionId: String(row.session_id),
+    podGeneration: Number.isSafeInteger(Number(row.pod_generation)) && Number(row.pod_generation) > 0
+      ? Number(row.pod_generation) : 1,
     harness: harnessValue(String(row.harness)),
     state: stateValue(row.state),
     imageDigest: String(row.image_digest),
@@ -416,6 +439,7 @@ function ensureCredentialShape(input: {
 function safeRuntimeInput(input: {
   readonly runtimeId: string;
   readonly sessionId: string;
+  readonly podGeneration: number;
   readonly imageDigest: string;
   readonly containerName?: string;
   readonly workspacePath?: string;
@@ -430,6 +454,9 @@ function safeRuntimeInput(input: {
   if (input.credentialVersion !== undefined
     && (!Number.isSafeInteger(input.credentialVersion) || input.credentialVersion < 1)) {
     throw new TypeError('credentialVersion must be a positive integer');
+  }
+  if (!Number.isSafeInteger(input.podGeneration) || input.podGeneration < 1) {
+    throw new TypeError('podGeneration must be a positive integer');
   }
 }
 
@@ -841,6 +868,7 @@ export class SandboxUserRegistryRepository {
   async createRuntime(input: {
     readonly sandboxUserId: string;
     readonly sessionId: string;
+    readonly podGeneration: number;
     readonly harness: SandboxUserHarness;
     readonly imageDigest: string;
     readonly runtimeId?: string;
@@ -854,21 +882,22 @@ export class SandboxUserRegistryRepository {
     const userId = sandboxUserIdValue(input.sandboxUserId);
     const runtimeId = textValue(input.runtimeId ?? randomUUID(), 'runtimeId');
     const sessionId = textValue(input.sessionId, 'sessionId');
+    const podGeneration = input.podGeneration;
     const harness = harnessValue(input.harness);
     const imageDigest = textValue(input.imageDigest, 'imageDigest');
-    safeRuntimeInput({ ...input, runtimeId, sessionId, imageDigest });
+    safeRuntimeInput({ ...input, runtimeId, sessionId, podGeneration, imageDigest });
     try {
       const result = await this.db.query<Record<string, unknown>>(
         `INSERT INTO sandbox_pod_runtime_manifests
-           (runtime_id, sandbox_user_id, session_id, harness, state, image_digest, container_name,
+           (runtime_id, sandbox_user_id, session_id, pod_generation, harness, state, image_digest, container_name,
             workspace_path, home_path, credential_version, source_repo, source_branch, manifest)
-         VALUES ($1, $2, $3, $4, 'provisioning', $5, $6, $7, $8, $9, $10, $11,
-                 jsonb_build_object('schemaVersion', 1, 'runtimeId', $1, 'sessionId', $3,
-                   'sandboxUserId', $2, 'harness', $4, 'imageDigest', $5))
-         RETURNING runtime_id, sandbox_user_id, session_id, harness, state, image_digest, container_name,
+         VALUES ($1, $2, $3, $4, $5, 'provisioning', $6, $7, $8, $9, $10, $11, $12,
+                 jsonb_build_object('schemaVersion', 2, 'runtimeId', $1, 'sessionId', $3,
+                   'sandboxUserId', $2, 'podGeneration', $4, 'harness', $5, 'imageDigest', $6))
+         RETURNING runtime_id, sandbox_user_id, session_id, pod_generation, harness, state, image_digest, container_name,
                    workspace_path, home_path, credential_version, source_repo, source_branch,
                    created_at, updated_at, stopped_at, failure_code`,
-        [runtimeId, userId, sessionId, harness, imageDigest, input.containerName ?? null, input.workspacePath ?? null,
+        [runtimeId, userId, sessionId, podGeneration, harness, imageDigest, input.containerName ?? null, input.workspacePath ?? null,
           input.homePath ?? null, input.credentialVersion ?? null, input.sourceRepo ?? null, input.sourceBranch ?? null],
       );
       return parseRuntime(result.rows[0]!);
@@ -879,10 +908,28 @@ export class SandboxUserRegistryRepository {
     const runtimeId = textValue(runtimeIdInput, 'runtimeId');
     try {
       const result = await this.db.query<Record<string, unknown>>(
-        `SELECT runtime_id, sandbox_user_id, session_id, harness, state, image_digest, container_name,
+        `SELECT runtime_id, sandbox_user_id, session_id, pod_generation, harness, state, image_digest, container_name,
+                workspace_path, home_path, credential_version, source_repo, source_branch,
+           created_at, updated_at, stopped_at, failure_code
+           FROM sandbox_pod_runtime_manifests WHERE runtime_id = $1`, [runtimeId],
+      );
+      return result.rows[0] ? parseRuntime(result.rows[0]) : undefined;
+    } catch (error) { throw dbError(error); }
+  }
+
+  /** Locate a cold manifest when a rolling upgrade changed the deterministic runtime id. */
+  async getRuntimeForSession(input: { readonly sessionId: string; readonly podGeneration: number }): Promise<SandboxPodRuntimeManifest | undefined> {
+    const sessionId = textValue(input.sessionId, 'sessionId');
+    if (!Number.isSafeInteger(input.podGeneration) || input.podGeneration < 1) {
+      throw new TypeError('podGeneration must be a positive integer');
+    }
+    try {
+      const result = await this.db.query<Record<string, unknown>>(
+        `SELECT runtime_id, sandbox_user_id, session_id, pod_generation, harness, state, image_digest, container_name,
                 workspace_path, home_path, credential_version, source_repo, source_branch,
                 created_at, updated_at, stopped_at, failure_code
-           FROM sandbox_pod_runtime_manifests WHERE runtime_id = $1`, [runtimeId],
+           FROM sandbox_pod_runtime_manifests
+          WHERE session_id = $1 AND pod_generation = $2`, [sessionId, input.podGeneration],
       );
       return result.rows[0] ? parseRuntime(result.rows[0]) : undefined;
     } catch (error) { throw dbError(error); }
@@ -900,7 +947,7 @@ export class SandboxUserRegistryRepository {
     const failureCode = input.failureCode === undefined ? undefined : textValue(input.failureCode, 'failureCode');
     return withTransaction(this.db, async tx => {
       const current = await tx.query<Record<string, unknown>>(
-        `SELECT runtime_id, sandbox_user_id, session_id, harness, state, image_digest, container_name,
+        `SELECT runtime_id, sandbox_user_id, session_id, pod_generation, harness, state, image_digest, container_name,
                 workspace_path, home_path, credential_version, source_repo, source_branch,
                 created_at, updated_at, stopped_at, failure_code
            FROM sandbox_pod_runtime_manifests WHERE runtime_id = $1 FOR UPDATE`, [runtimeId],
@@ -916,7 +963,7 @@ export class SandboxUserRegistryRepository {
                 stopped_at = CASE WHEN $2 IN ('stopped', 'failed') THEN COALESCE(stopped_at, now()) ELSE NULL END,
                 updated_at = now()
           WHERE runtime_id = $1
-        RETURNING runtime_id, sandbox_user_id, session_id, harness, state, image_digest, container_name,
+        RETURNING runtime_id, sandbox_user_id, session_id, pod_generation, harness, state, image_digest, container_name,
                   workspace_path, home_path, credential_version, source_repo, source_branch,
                   created_at, updated_at, stopped_at, failure_code`,
         [runtimeId, state, failureCode ?? null],
@@ -930,7 +977,7 @@ export class SandboxUserRegistryRepository {
     const normalized = states?.map(stateValue);
     try {
       const result = await this.db.query<Record<string, unknown>>(
-        `SELECT runtime_id, sandbox_user_id, session_id, harness, state, image_digest, container_name,
+        `SELECT runtime_id, sandbox_user_id, session_id, pod_generation, harness, state, image_digest, container_name,
                 workspace_path, home_path, credential_version, source_repo, source_branch,
                 created_at, updated_at, stopped_at, failure_code
            FROM sandbox_pod_runtime_manifests
