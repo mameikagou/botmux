@@ -5035,6 +5035,7 @@ export async function forkSession(
   // non-secret principal posture. The child still rehydrates its transient
   // credential at cold spawn; never copy the decrypted secret into Session.
   childSession.execution = ds.session.execution;
+  childSession.executionMode = ds.session.executionMode;
   childSession.principalBinding = ds.session.principalBinding;
   childSession.credentialBinding = ds.session.credentialBinding;
   // Bot identity on the PERSISTED row. Every other createSession caller sets
@@ -6364,7 +6365,12 @@ export function forkWorker(
   // Freeze the execution profile at the topic/session boundary. A later bot
   // config edit must not move an existing conversation between host and
   // Podman, while a new Podman topic still receives the current profile.
-  const podmanExecution = ds.session.execution ?? botCfg.execution;
+  // A native principal is an explicit frozen host-execution decision. Never
+  // fall back to the live bot's Podman profile for a native session during a
+  // restart or cold restore.
+  const podmanExecution = ds.session.executionMode === 'native'
+    ? undefined
+    : ds.session.execution ?? botCfg.execution;
   if (podmanExecution) {
     // All async cold-start call sites hydrate the principal before reaching
     // this synchronous fork boundary. Keep this invariant here as a final
@@ -6372,8 +6378,9 @@ export function forkWorker(
     // or accidentally put ChatGPT auth JSON into IPC.
     assertPodmanPrincipalReadyForFork({ ds, execution: podmanExecution, cliId: botCfg.cliId });
   }
-  if (!ds.session.execution && botCfg.execution) {
+  if (!ds.session.execution && podmanExecution && ds.session.executionMode !== 'native') {
     ds.session.execution = botCfg.execution;
+    ds.session.executionMode = 'podman';
     sessionStore.updateSession(ds.session);
   }
   // A bare /repo placeholder (and a non-Codex empty group-join setup) owns no

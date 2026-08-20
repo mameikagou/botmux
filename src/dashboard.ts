@@ -3044,6 +3044,7 @@ async function handleAgentCredentialsRoute(req: IncomingMessage, res: ServerResp
       path: url.pathname,
       body,
       principal: identity.key,
+      ownerOpenId: bot?.ownerOpenId,
       chatType: 'p2p',
       botCliId: bot?.cliId,
     }, {

@@ -125,13 +125,37 @@ export async function ensureSandboxPrincipalForFork(input: {
   readonly execution?: PodmanExecutionConfig;
   readonly cliId: string;
   readonly persist?: (session: DaemonSession['session']) => void;
+  /** Test seam; production always uses the process-wide repository. */
+  readonly repository?: Pick<AgentPrincipalRepository, 'resolveExecutionModeForNewInstance' | 'resolveForNewInstance'>;
 }): Promise<void> {
   const { ds, execution, cliId } = input;
+  // Native is a durable per-session decision. Once stamped, later messages,
+  // worker restarts, and daemon cold restores must never consult the principal
+  // table again or fall back to the bot's Podman profile.
+  if (ds.session.executionMode === 'native') return;
   if (!execution) return;
   // The daemon clears credentialSecret immediately after dispatching init, so
   // its absence alone does not mean this topic is cold. A live worker already
   // owns the frozen binding and must never trigger a per-message DB lookup.
   if (ds.worker && !ds.worker.killed) return;
+  const principalRepository = input.repository ?? getRepository();
+  if (!ds.session.executionMode && !ds.session.execution && !ds.session.principalBinding && !ds.session.credentialBinding) {
+    const openId = ds.ownerOpenId ?? ds.session.ownerOpenId;
+    if (!openId) throw new Error('a sandbox session requires an app-scoped owner open_id');
+    const mode = await principalRepository.resolveExecutionModeForNewInstance({
+      key: { larkAppId: ds.larkAppId, openId },
+      ownerOpenId: openId,
+    });
+    ds.session.executionMode = mode.executionMode;
+    input.persist?.(ds.session);
+    if (mode.executionMode === 'native') return;
+  } else if (!ds.session.executionMode) {
+    // Sessions persisted by the pre-mode build are already Podman-bound when
+    // they carry execution/principal material. Preserve that conservative
+    // posture and make the decision explicit for future cold restarts.
+    ds.session.executionMode = 'podman';
+    input.persist?.(ds.session);
+  }
   if (!ds.session.execution) {
     ds.session.execution = execution;
     input.persist?.(ds.session);
@@ -141,7 +165,7 @@ export async function ensureSandboxPrincipalForFork(input: {
       const resolved = await materializeColdPodmanCredential({
         ds,
         cliId,
-        repository: getRepository(),
+        repository: principalRepository,
         persist: input.persist ? session => input.persist?.(session) : undefined,
       });
       materializeCodexCredential({
@@ -172,7 +196,7 @@ export async function ensureSandboxPrincipalForFork(input: {
   const resolved = await bindNewPodmanSession({
     ds,
     cliId,
-    repository: getRepository(),
+    repository: principalRepository,
     persist: session => input.persist?.(session),
   });
   if (resolved) {

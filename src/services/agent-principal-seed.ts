@@ -1,4 +1,4 @@
-import type { AgentPrincipalKey, AgentPrincipalRepository, AgentPrincipalRow } from './agent-principal-store.js';
+import type { AgentExecutionMode, AgentPrincipalKey, AgentPrincipalRepository, AgentPrincipalRow } from './agent-principal-store.js';
 
 export interface SeedBotConfig {
   readonly larkAppId: string;
@@ -8,6 +8,7 @@ export interface SeedBotConfig {
 export interface SeedPrincipalRow {
   readonly key: AgentPrincipalKey;
   readonly canOpenMemory: boolean;
+  readonly executionMode?: AgentExecutionMode;
   readonly reason: 'allowed_user' | 'explicit_owner';
 }
 
@@ -140,6 +141,11 @@ export async function seedAgentPrincipals(input: {
   readonly dryRun: boolean;
 }): Promise<{ readonly rows: SeedPrincipalRow[]; readonly persisted?: AgentPrincipalRow[] }> {
   if (input.dryRun) return { rows: [...input.rows] };
-  const persisted = await input.repository.seedPrincipals(input.rows.map(row => ({ key: row.key, canOpenMemory: row.canOpenMemory, enabled: true })));
+  const persisted = await input.repository.seedPrincipals(input.rows.map(row => ({
+    key: row.key,
+    canOpenMemory: row.canOpenMemory,
+    enabled: true,
+    ...(row.executionMode ? { executionMode: row.executionMode } : {}),
+  })));
   return { rows: [...input.rows], persisted };
 }

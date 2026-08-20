@@ -480,6 +480,9 @@ export interface Session {
   cliId?: import('./adapters/cli/types.js').CliId;
   /** Frozen V3 Podman execution profile. Absent means the legacy host path. */
   execution?: PodmanExecutionConfig;
+  /** Frozen principal launch mode. Native sessions deliberately keep
+   * `execution` absent; Podman sessions carry both this marker and profile. */
+  executionMode?: 'native' | 'podman';
   /** Frozen principal identity/capability supplied by the T6 boundary. */
   principalBinding?: PrincipalBinding;
   /** Frozen non-secret credential metadata supplied by the T6 boundary. */

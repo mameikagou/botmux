@@ -1,5 +1,5 @@
 /** Minimal dashboard/pairing identity chain for per-principal BYOK. */
-import type { AgentPrincipalKey, AgentPrincipalRepository, AgentCredentialMetadata, AgentPrincipalRow } from '../services/agent-principal-store.js';
+import type { AgentExecutionMode, AgentPrincipalKey, AgentPrincipalRepository, AgentCredentialMetadata, AgentPrincipalRow } from '../services/agent-principal-store.js';
 import { AgentPrincipalLookupError, CodexLoginTaskConflictError } from '../services/agent-principal-store.js';
 import { validateApiCredentialEndpoint, validateApiCredentialInput } from '../services/agent-credential-policy.js';
 import { AgentCredentialProbeError } from '../services/agent-credential-probe.js';
@@ -11,6 +11,8 @@ export interface AgentCredentialsApiRequest {
   readonly body?: unknown;
   /** Set by the already-authenticated dashboard/pairing request. */
   readonly principal: AgentPrincipalKey;
+  /** Configured owner identity; execution-mode mutation is owner-only. */
+  readonly ownerOpenId?: string;
   readonly chatType?: 'p2p' | 'group';
   readonly botCliId?: string;
 }
@@ -22,7 +24,7 @@ export interface AgentCredentialsApiResponse {
 
 export interface AgentCredentialsApiDeps {
   readonly repository: Pick<AgentPrincipalRepository,
-    'getPrincipal' | 'getCredential' | 'putCredential' | 'deleteCredential'>;
+    'getPrincipal' | 'getCredential' | 'putCredential' | 'deleteCredential' | 'setExecutionMode'>;
   readonly stopSessionsForPrincipal?: (key: AgentPrincipalKey) => Promise<void> | void;
   readonly loginService?: Pick<CodexDeviceLoginService, 'begin' | 'complete' | 'status' | 'logout'>;
   readonly validateEndpoint?: (baseUrl: string) => Promise<URL>;
@@ -73,6 +75,7 @@ function publicPrincipal(principal: AgentPrincipalRow | undefined, botCliId?: st
     ...(botCliId ? { harness: botCliId } : {}),
     enabled: principal.enabled,
     canOpenMemory: principal.canOpenMemory,
+    executionMode: principal.executionMode,
     updatedAt: principal.updatedAt,
   };
 }
@@ -118,9 +121,20 @@ export async function handleAgentCredentialsApi(
   const key = request.principal;
   try {
     if (request.path === '/api/agent/principal') {
-      if (request.method !== 'GET') return bad(403, 'principal_mutation_forbidden');
       const principalError = await requireActivePrincipal(key, deps.repository);
       if (principalError) return principalError;
+      if (request.method === 'PATCH') {
+        // Host-native execution is a capability grant. A guest must never be
+        // able to turn its own pairing into a host process, even though the
+        // request is authenticated for that guest principal.
+        if (!request.ownerOpenId || request.ownerOpenId !== key.openId) return bad(403, 'principal_owner_required');
+        const body = bodyObject(request.body);
+        if (body.executionMode !== 'native' && body.executionMode !== 'podman') throw new TypeError('executionMode is required');
+        const updated = await deps.repository.setExecutionMode(key, body.executionMode as AgentExecutionMode);
+        await deps.stopSessionsForPrincipal?.(key);
+        return ok({ principal: publicPrincipal(updated, request.botCliId) });
+      }
+      if (request.method !== 'GET') return bad(403, 'principal_mutation_forbidden');
       return ok({ principal: publicPrincipal(await deps.repository.getPrincipal(key), request.botCliId) });
     }
 

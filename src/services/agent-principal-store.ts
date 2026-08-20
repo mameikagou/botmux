@@ -33,9 +33,13 @@ export interface AgentPrincipalKey {
   readonly openId: string;
 }
 
+/** Where a new topic for this app-scoped principal is allowed to execute. */
+export type AgentExecutionMode = 'native' | 'podman';
+
 export interface AgentPrincipalRow extends AgentPrincipalKey {
   readonly enabled: boolean;
   readonly canOpenMemory: boolean;
+  readonly executionMode: AgentExecutionMode;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -130,12 +134,27 @@ CREATE TABLE IF NOT EXISTS agent_principals (
   open_id text NOT NULL,
   enabled boolean NOT NULL DEFAULT true,
   can_openmemory boolean NOT NULL DEFAULT false,
+  execution_mode text NOT NULL DEFAULT 'podman' CHECK (execution_mode IN ('native', 'podman')),
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (lark_app_id, open_id),
   CHECK (length(trim(lark_app_id)) > 0),
   CHECK (length(trim(open_id)) > 0)
 );
+ALTER TABLE agent_principals
+  ADD COLUMN IF NOT EXISTS execution_mode text NOT NULL DEFAULT 'podman';
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'agent_principals'::regclass
+      AND conname = 'agent_principals_execution_mode_check'
+  ) THEN
+    ALTER TABLE agent_principals
+      ADD CONSTRAINT agent_principals_execution_mode_check
+      CHECK (execution_mode IN ('native', 'podman'));
+  END IF;
+END $$;
 `;
 
 export const AGENT_CREDENTIAL_UP_SQL = `
@@ -250,6 +269,13 @@ function boolValue(raw: unknown, fallback = false): boolean {
   return typeof raw === 'boolean' ? raw : raw === 't' ? true : raw === 'f' ? false : fallback;
 }
 
+function executionModeValue(raw: unknown): AgentExecutionMode {
+  // Rows created before the mode column was introduced are deliberately
+  // treated as Podman. This preserves the existing isolation posture during
+  // a rolling migration and never upgrades a legacy principal to host access.
+  return raw === 'native' ? 'native' : 'podman';
+}
+
 function dateValue(raw: unknown): string {
   return raw instanceof Date ? raw.toISOString() : typeof raw === 'string' ? raw : new Date(0).toISOString();
 }
@@ -260,6 +286,7 @@ function parsePrincipal(row: Record<string, unknown>): AgentPrincipalRow {
     openId: String(row.open_id),
     enabled: boolValue(row.enabled),
     canOpenMemory: boolValue(row.can_openmemory),
+    executionMode: executionModeValue(row.execution_mode),
     createdAt: dateValue(row.created_at),
     updatedAt: dateValue(row.updated_at),
   };
@@ -334,7 +361,7 @@ export class AgentPrincipalRepository {
     const [appId, openId] = keyValues(key);
     try {
       const result = await this.db.query<Record<string, unknown>>(
-        `SELECT lark_app_id, open_id, enabled, can_openmemory, created_at, updated_at
+        `SELECT lark_app_id, open_id, enabled, can_openmemory, execution_mode, created_at, updated_at
            FROM agent_principals WHERE lark_app_id = $1 AND open_id = $2`,
         [appId, openId],
       );
@@ -362,6 +389,31 @@ export class AgentPrincipalRepository {
     }
   }
 
+  /** Resolve only the non-secret launch posture for a new topic. */
+  async resolveExecutionModeForNewInstance(input: {
+    readonly key: AgentPrincipalKey;
+    readonly ownerOpenId?: string;
+  }): Promise<{ principal: AgentPrincipalRow; executionMode: AgentExecutionMode }> {
+    const key = { larkAppId: textKey(input.key.larkAppId, 'larkAppId'), openId: textKey(input.key.openId, 'openId') };
+    let principal: AgentPrincipalRow | undefined;
+    try {
+      const result = await this.db.query<Record<string, unknown>>(
+        `SELECT lark_app_id, open_id, enabled, can_openmemory, execution_mode, created_at, updated_at
+           FROM agent_principals WHERE lark_app_id = $1 AND open_id = $2`,
+        keyValues(key),
+      );
+      principal = result.rows[0] ? parsePrincipal(result.rows[0]) : undefined;
+    } catch (error) {
+      throw toDbError(error);
+    }
+    if (!principal) throw new AgentPrincipalLookupError('not_found', 'principal is not registered for this Lark app');
+    if (!principal.enabled) throw new AgentPrincipalLookupError('disabled', 'principal is disabled');
+    if (input.ownerOpenId && input.ownerOpenId !== principal.openId) {
+      throw new AgentPrincipalLookupError('disabled', 'session owner does not match the requesting principal');
+    }
+    return { principal, executionMode: principal.executionMode };
+  }
+
   /** The only new-instance lookup. Callers must persist its result on Session. */
   async resolveForNewInstance(input: {
     readonly key: AgentPrincipalKey;
@@ -374,7 +426,7 @@ export class AgentPrincipalRepository {
     let result: SqlResult<Record<string, unknown>>;
     try {
       result = await this.db.query<Record<string, unknown>>(
-        `SELECT p.lark_app_id, p.open_id, p.enabled, p.can_openmemory,
+        `SELECT p.lark_app_id, p.open_id, p.enabled, p.can_openmemory, p.execution_mode,
                 p.created_at, p.updated_at,
                 c.credential_kind, c.base_url, c.model, c.encrypted_secret,
                 c.secret_nonce, c.credential_version, c.updated_at AS credential_updated_at
@@ -393,6 +445,9 @@ export class AgentPrincipalRepository {
     if (!principal.enabled) throw new AgentPrincipalLookupError('disabled', 'principal is disabled');
     if (input.ownerOpenId && input.ownerOpenId !== openId && !input.adminOverride) {
       throw new AgentPrincipalLookupError('disabled', 'session owner does not match the requesting principal');
+    }
+    if (principal.executionMode !== 'podman') {
+      throw new AgentPrincipalLookupError('credential_incompatible', 'native principals do not use Podman credentials');
     }
     if (!row.credential_kind || row.encrypted_secret === undefined || row.secret_nonce === undefined) {
       throw new AgentPrincipalLookupError('credential_missing', 'no compatible model credential is configured');
@@ -432,18 +487,20 @@ export class AgentPrincipalRepository {
     readonly key: AgentPrincipalKey;
     readonly enabled?: boolean;
     readonly canOpenMemory?: boolean;
+    readonly executionMode?: AgentExecutionMode;
   }): Promise<AgentPrincipalRow> {
     const [appId, openId] = keyValues(input.key);
     try {
       const result = await this.db.query<Record<string, unknown>>(
-        `INSERT INTO agent_principals (lark_app_id, open_id, enabled, can_openmemory)
-         VALUES ($1, $2, COALESCE($3, true), COALESCE($4, false))
+        `INSERT INTO agent_principals (lark_app_id, open_id, enabled, can_openmemory, execution_mode)
+         VALUES ($1, $2, COALESCE($3, true), COALESCE($4, false), COALESCE($5, 'podman'))
          ON CONFLICT (lark_app_id, open_id) DO UPDATE SET
            enabled = COALESCE($3, agent_principals.enabled),
            can_openmemory = COALESCE($4, agent_principals.can_openmemory),
+           execution_mode = COALESCE($5, agent_principals.execution_mode),
            updated_at = now()
-         RETURNING lark_app_id, open_id, enabled, can_openmemory, created_at, updated_at`,
-        [appId, openId, input.enabled ?? null, input.canOpenMemory ?? null],
+         RETURNING lark_app_id, open_id, enabled, can_openmemory, execution_mode, created_at, updated_at`,
+        [appId, openId, input.enabled ?? null, input.canOpenMemory ?? null, input.executionMode ?? null],
       );
       return parsePrincipal(result.rows[0]!);
     } catch (error) {
@@ -457,7 +514,7 @@ export class AgentPrincipalRepository {
       const result = await this.db.query<Record<string, unknown>>(
         `UPDATE agent_principals SET enabled = $3, updated_at = now()
           WHERE lark_app_id = $1 AND open_id = $2
-          RETURNING lark_app_id, open_id, enabled, can_openmemory, created_at, updated_at`,
+          RETURNING lark_app_id, open_id, enabled, can_openmemory, execution_mode, created_at, updated_at`,
         [appId, openId, enabled],
       );
       return result.rows[0] ? parsePrincipal(result.rows[0]) : undefined;
@@ -472,8 +529,24 @@ export class AgentPrincipalRepository {
       const result = await this.db.query<Record<string, unknown>>(
         `UPDATE agent_principals SET can_openmemory = $3, updated_at = now()
           WHERE lark_app_id = $1 AND open_id = $2
-          RETURNING lark_app_id, open_id, enabled, can_openmemory, created_at, updated_at`,
+          RETURNING lark_app_id, open_id, enabled, can_openmemory, execution_mode, created_at, updated_at`,
         [appId, openId, canOpenMemory],
+      );
+      return result.rows[0] ? parsePrincipal(result.rows[0]) : undefined;
+    } catch (error) {
+      throw toDbError(error);
+    }
+  }
+
+  async setExecutionMode(key: AgentPrincipalKey, executionMode: AgentExecutionMode): Promise<AgentPrincipalRow | undefined> {
+    const [appId, openId] = keyValues(key);
+    if (executionMode !== 'native' && executionMode !== 'podman') throw new TypeError('invalid execution mode');
+    try {
+      const result = await this.db.query<Record<string, unknown>>(
+        `UPDATE agent_principals SET execution_mode = $3, updated_at = now()
+          WHERE lark_app_id = $1 AND open_id = $2
+          RETURNING lark_app_id, open_id, enabled, can_openmemory, execution_mode, created_at, updated_at`,
+        [appId, openId, executionMode],
       );
       return result.rows[0] ? parsePrincipal(result.rows[0]) : undefined;
     } catch (error) {
@@ -604,7 +677,7 @@ export class AgentPrincipalRepository {
     }
   }
 
-  async seedPrincipals(rows: ReadonlyArray<{ key: AgentPrincipalKey; canOpenMemory?: boolean; enabled?: boolean }>): Promise<AgentPrincipalRow[]> {
+  async seedPrincipals(rows: ReadonlyArray<{ key: AgentPrincipalKey; canOpenMemory?: boolean; enabled?: boolean; executionMode?: AgentExecutionMode }>): Promise<AgentPrincipalRow[]> {
     let client: SqlTransaction;
     try {
       client = await this.db.connect();
@@ -617,14 +690,15 @@ export class AgentPrincipalRepository {
       for (const row of rows) {
         const [appId, openId] = keyValues(row.key);
         const upserted = await client.query<Record<string, unknown>>(
-          `INSERT INTO agent_principals (lark_app_id, open_id, enabled, can_openmemory)
-           VALUES ($1, $2, COALESCE($3, true), COALESCE($4, false))
+        `INSERT INTO agent_principals (lark_app_id, open_id, enabled, can_openmemory, execution_mode)
+           VALUES ($1, $2, COALESCE($3, true), COALESCE($4, false), COALESCE($5, 'podman'))
            ON CONFLICT (lark_app_id, open_id) DO UPDATE SET
              enabled = COALESCE($3, agent_principals.enabled),
              can_openmemory = COALESCE($4, agent_principals.can_openmemory),
+             execution_mode = COALESCE($5, agent_principals.execution_mode),
              updated_at = now()
-           RETURNING lark_app_id, open_id, enabled, can_openmemory, created_at, updated_at`,
-          [appId, openId, row.enabled ?? null, row.canOpenMemory ?? null],
+           RETURNING lark_app_id, open_id, enabled, can_openmemory, execution_mode, created_at, updated_at`,
+          [appId, openId, row.enabled ?? null, row.canOpenMemory ?? null, row.executionMode ?? null],
         );
         result.push(parsePrincipal(upserted.rows[0]!));
       }
