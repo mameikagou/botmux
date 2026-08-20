@@ -385,7 +385,12 @@ function parsePodState(raw: string, binding: PodmanPodBinding): PodmanPodState {
   try { value = JSON.parse(raw); } catch { return { status: 'unknown', podName: binding.podName, binding, error: 'Podman returned invalid pod inspect JSON' }; }
   const object = value && typeof value === 'object' ? value as Record<string, unknown> : {};
   const stateObject = object.State && typeof object.State === 'object' ? object.State as Record<string, unknown> : object;
-  const rawStatus = String(stateObject.Status ?? stateObject.status ?? '').toLowerCase();
+  // Podman versions differ here: some emit `State: {Status: "Running"}`
+  // while `pod inspect --format={{json .}}` on this host emits
+  // `State: "Running"`. Accept both shapes, but keep unknown states fail-closed.
+  const rawStatus = (typeof object.State === 'string'
+    ? object.State
+    : stateObject.Status ?? stateObject.status ?? '').toString().toLowerCase();
   const status: PodmanPodStatus = rawStatus === 'running'
     ? 'running'
     : rawStatus === 'created'

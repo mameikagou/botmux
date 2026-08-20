@@ -115,6 +115,37 @@ describe('PodmanUserPodManager', () => {
     expect(fake.calls.some(args => args[0] === 'pod' && args[1] === 'start')).toBe(true);
   });
 
+  it('parses Podman inspect responses whose top-level State is a string', async () => {
+    const root = mkdtempSync('/tmp/botmux-user-pod-state-shape-');
+    let state = 'Created';
+    const manager = new PodmanUserPodManager(root, {
+      commandRunner: async () => {
+        const binding = manager.binding({ larkAppId: 'app', sandboxUserId: 'user-state', podGeneration: 1, canOpenMemory: false });
+        return {
+          status: 0,
+          stdout: JSON.stringify({
+            Id: `id-${binding.podName}`,
+            State: state,
+            Config: {
+              Labels: {
+                'io.botmux.managed': 'true',
+                'io.botmux.sandbox-user-hash': binding.sandboxUserHash,
+                'io.botmux.pod-generation': '1',
+                'io.botmux.network-profile': 'guest',
+              },
+            },
+          }),
+          stderr: '',
+        };
+      },
+      hostEnv: { PATH: '/usr/bin', HOME: '/home/test' },
+    });
+    const binding = manager.binding({ larkAppId: 'app', sandboxUserId: 'user-state', podGeneration: 1, canOpenMemory: false });
+    expect((await manager.inspect(binding)).status).toBe('created');
+    state = 'Running';
+    expect((await manager.inspect(binding)).status).toBe('running');
+  });
+
   it('keeps session leases independent and removes only stale leases', async () => {
     const root = mkdtempSync('/tmp/botmux-user-pod-lease-');
     const fake = fakePodman();
