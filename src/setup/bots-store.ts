@@ -7,15 +7,30 @@
 import { writeFileSync, renameSync, existsSync, readFileSync } from 'node:fs';
 import { withFileLockSync } from '../utils/file-lock.js';
 
+function writeBotsJsonUnlocked(botsJsonPath: string, bots: any[]): void {
+  const tmp = botsJsonPath + '.tmp';
+  writeFileSync(tmp, JSON.stringify(bots, null, 2) + '\n', { mode: 0o600 });
+  renameSync(tmp, botsJsonPath);
+}
+
 export function writeBotsJsonAtomic(botsJsonPath: string, bots: any[]): void {
   // PM2 start surfaces hold this same generation lock from snapshot through
   // post-start verification/rollback, so the ecosystem and its expected names
   // can never be built from different bots.json generations.
   withFileLockSync(botsJsonPath, () => {
     // 注意: tmp 必须在同一目录下 (同 fs), 否则 rename 可能跨文件系统失败.
-    const tmp = botsJsonPath + '.tmp';
-    writeFileSync(tmp, JSON.stringify(bots, null, 2) + '\n', { mode: 0o600 });
-    renameSync(tmp, botsJsonPath);
+    writeBotsJsonUnlocked(botsJsonPath, bots);
+  });
+}
+
+/** Hold one bots.json generation across an administrative read/modify/write. */
+export function updateBotsJsonAtomic(
+  botsJsonPath: string,
+  update: (bots: any[]) => any[],
+): void {
+  withFileLockSync(botsJsonPath, () => {
+    const current = readBotsJsonOrEmpty(botsJsonPath);
+    writeBotsJsonUnlocked(botsJsonPath, update(current));
   });
 }
 

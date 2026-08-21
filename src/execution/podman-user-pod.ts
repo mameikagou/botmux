@@ -181,11 +181,11 @@ function verifyTcpPort(port: number): Promise<void> {
   });
 }
 
-function hashPart(value: string): string {
+export function sandboxUserHashForId(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex').slice(0, 24);
 }
 
-function podName(sandboxUserHash: string, generation: number): string {
+export function sandboxUserPodName(sandboxUserHash: string, generation: number): string {
   // Both pieces are fixed-width/validated, so the name remains well inside
   // Podman's name limit and cannot be confused with a session container.
   return `botmux-user-${sandboxUserHash}-g${generation}`;
@@ -476,14 +476,14 @@ export class PodmanUserPodManager {
     // sandboxUserId is deployment-stable and may be reached through more than
     // one Lark app. App scope is retained on the binding for authorization and
     // audit, but it must not split the user's shared pod.
-    const sandboxUserHash = hashPart(sandboxUserId);
+    const sandboxUserHash = sandboxUserHashForId(sandboxUserId);
     const metadataRoot = join(this.runtimeRoot, POD_ROOT_NAME, sandboxUserHash, `g${podGeneration}`);
     return {
       larkAppId,
       sandboxUserId,
       podGeneration,
       sandboxUserHash,
-      podName: podName(sandboxUserHash, podGeneration),
+      podName: sandboxUserPodName(sandboxUserHash, podGeneration),
       metadataRoot,
       networkProfile: input.canOpenMemory ? 'owner-memory' : 'guest',
       ...(this.guestProxy && !input.canOpenMemory ? { guestProxy: this.guestProxy } : {}),
@@ -553,7 +553,7 @@ export class PodmanUserPodManager {
       sandboxUserHash: binding.sandboxUserHash,
       podGeneration: binding.podGeneration,
       podName: binding.podName,
-      larkAppHash: hashPart(binding.larkAppId),
+      larkAppHash: sandboxUserHashForId(binding.larkAppId),
       networkProfile: binding.networkProfile,
       ...(binding.guestProxy ? { proxyRoute: binding.guestProxy.selectedRoute } : {}),
       createdAt: this.now(),

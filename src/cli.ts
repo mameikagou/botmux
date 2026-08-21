@@ -22,6 +22,7 @@
  *   botmux delete all     — close all active sessions
  *   botmux autostart enable|disable|status — manage boot-time autostart (launchd / user systemd / Windows Task Scheduler)
  *   botmux whiteboard status|enable|disable|current|list|read|update|write — local project whiteboard
+ *   botmux sandbox-user add|bind|list|enable|disable|pods — administer stable guest sandboxes
  */
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, symlinkSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync } from 'node:fs';
@@ -6815,6 +6816,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   whiteboard status|enable|disable
                        本地项目白板（默认关闭；enable 只打开能力，不创建白板）
        current --create / list / read / update / write --yes
+  sandbox-user add|bind|list|enable|disable|pods
+                       管理稳定 guest 用户、飞书 app-scoped identity 与冷 Pod 状态
+                       运行 \`botmux sandbox-user help\` 查看完整参数
 
 定时任务（可在 CLI 会话内自动推断 chat）:
   schedule list                        列出所有任务
@@ -13242,6 +13246,17 @@ switch (command) {
       await runAgentPrincipalSeedCommand(process.argv.slice(3));
     } catch (error) {
       console.error(`agent-principals failed: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 2;
+    }
+    break;
+  }
+  case 'sandbox-user':
+  case 'sandbox-users': {
+    try {
+      const { runSandboxUserCommand } = await import('./cli/sandbox-users.js');
+      await runSandboxUserCommand(process.argv.slice(3));
+    } catch (error) {
+      console.error(`sandbox-user failed: ${error instanceof Error ? error.message : String(error)}`);
       process.exitCode = 2;
     }
     break;

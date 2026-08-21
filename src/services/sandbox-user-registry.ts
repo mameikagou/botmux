@@ -551,6 +551,57 @@ export class SandboxUserRegistryRepository {
     } catch (error) { throw dbError(error); }
   }
 
+  async listUsers(): Promise<readonly SandboxUserRow[]> {
+    try {
+      const result = await this.db.query<Record<string, unknown>>(
+        `SELECT sandbox_user_id, enabled, can_openmemory, execution_mode, pod_generation, created_at, updated_at
+           FROM sandbox_users
+          ORDER BY created_at ASC, sandbox_user_id ASC`,
+      );
+      return result.rows.map(parseUser);
+    } catch (error) { throw dbError(error); }
+  }
+
+  async listIdentities(user?: SandboxUserKey): Promise<readonly SandboxUserIdentityRow[]> {
+    const userId = user ? sandboxUserIdValue(user.sandboxUserId) : undefined;
+    try {
+      const result = await this.db.query<Record<string, unknown>>(
+        `SELECT sandbox_user_id, lark_app_id, open_id, enabled AS identity_enabled,
+                created_at AS identity_created_at, updated_at AS identity_updated_at
+           FROM sandbox_user_identities
+          WHERE ($1::text IS NULL OR sandbox_user_id = $1)
+          ORDER BY sandbox_user_id ASC, lark_app_id ASC`,
+        [userId ?? null],
+      );
+      return result.rows.map(parseIdentity);
+    } catch (error) { throw dbError(error); }
+  }
+
+  /**
+   * Enabling or disabling a user also advances its Pod generation. This makes
+   * every already-frozen topic fail its next cold rebuild instead of reviving
+   * an instance created under the previous authorization state.
+   */
+  async setUserEnabled(key: SandboxUserKey, enabled: boolean): Promise<SandboxUserRow> {
+    const id = sandboxUserIdValue(key.sandboxUserId);
+    try {
+      const result = await this.db.query<Record<string, unknown>>(
+        `UPDATE sandbox_users
+            SET enabled = $2,
+                pod_generation = CASE WHEN enabled IS DISTINCT FROM $2 THEN pod_generation + 1 ELSE pod_generation END,
+                updated_at = now()
+          WHERE sandbox_user_id = $1
+        RETURNING sandbox_user_id, enabled, can_openmemory, execution_mode, pod_generation, created_at, updated_at`,
+        [id, enabled],
+      );
+      if (!result.rows[0]) throw new SandboxUserLookupError('not_found', 'sandbox user is not registered');
+      return parseUser(result.rows[0]);
+    } catch (error) {
+      if (error instanceof SandboxUserLookupError) throw error;
+      throw dbError(error);
+    }
+  }
+
   /**
    * Atomically fence a replacement pod. Existing sessions keep their frozen
    * generation and therefore cannot attach to the replacement. New sessions
